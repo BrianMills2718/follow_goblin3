@@ -48,7 +48,7 @@ RAPIDAPI_HOST = "twitter283.p.rapidapi.com"  # Updated API host
 
 # Add these constants after the existing RAPIDAPI constants
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-#OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
+OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 COMMUNITY_COLORS = {}  # Will be populated dynamically
 
 async def get_following_async(screenname: str, session: aiohttp.ClientSession, cursor=None):
@@ -313,15 +313,19 @@ async def fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1):
     """Fetch tweets and generate summary for an account - with optimizations"""
     username = node["screen_name"]
     
-    # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
-    tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
-    
-    # Generate summary if tweets were found
-    summary = "No tweets available"
-    if tweets:
-        summary = await generate_tweet_summary(tweets, username)
-    
-    return (node_id, tweets, summary)
+    try:
+        # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
+        tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
+        
+        # Generate summary if tweets were found
+        summary = "No tweets available"
+        if tweets:
+            summary = await generate_tweet_summary(tweets, username)
+        
+        return (node_id, tweets, summary)
+    except Exception as e:
+        st.error(f"Error processing tweets for @{username}: {str(e)}")
+        return (node_id, [], f"Error fetching tweets: {str(e)}")
 
 def filter_nodes(nodes, filters):
     """
@@ -1337,11 +1341,17 @@ def main():
                 username = filtered_nodes[node_id]["screen_name"]
                 if username in st.session_state.node_communities:
                     community = st.session_state.node_communities[username]
-                    # Add debug check
-                    if community not in st.session_state.community_colors:
-                        st.warning(f"Invalid community label found: {community}")
-                        community = "Other"
-                    filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
+                    # Add safety check for community ID
+                    if community in st.session_state.community_colors:
+                        filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
+                    else:
+                        # Assign default color for unknown communities
+                        st.warning(f"Community {community} not found in color mapping for user @{username}. Assigning to 'Other' category.")
+                        filtered_nodes[node_id]["community_color"] = "#cccccc"  # Default gray color
+                        # Reassign node to "Other" community if it exists
+                        other_community = next((cid for cid, label in st.session_state.community_labels.items() 
+                                             if label.lower() == "other"), "0")
+                        st.session_state.node_communities[username] = other_community
         
         # Update size_factors dictionary
         size_factors = {
@@ -1485,57 +1495,16 @@ def main():
         with col2:
             if st.button("Summarize Tweets for Top Accounts"):
                 with st.spinner("Fetching tweets and generating summaries..."):
-                    # Get top accounts based on importance scores (use same scores as visualization)
+                    # Get top accounts based on importance scores
                     top_accounts = []
                     for node_id, node in filtered_nodes.items():
-                        if not node_id.startswith("orig_"):  # Skip original node
-                            score = importance_scores.get(node_id, 0)  # Use same scores as visualization
+                        if not node_id.startswith("orig_"):
+                            score = importance_scores.get(node_id, 0)
                             top_accounts.append((node_id, score, node))
                     
                     # Sort by score and limit to same number as visualization
                     top_accounts.sort(key=lambda x: x[1], reverse=True)
                     top_accounts = top_accounts[:max_accounts_display]
-                    
-                    # Prepare for async processing
-                    async def summarize_top_accounts():
-                        # Add a debug message to see progress
-                        st.write("Starting tweet summarization process...")
-                        
-                        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50)) as session:  # Increase connection limit
-                            # Process ALL accounts in parallel rather than batches
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            
-                            # Create all tasks at once
-                            tasks = []
-                            for i, (node_id, _, node) in enumerate(top_accounts):
-                                # Add debugging to identify slow accounts
-                                task = fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1)  # Reduce pages for speed
-                                tasks.append(task)
-                            
-                            # Execute all tasks concurrently and process results as they complete
-                            for i, future in enumerate(asyncio.as_completed(tasks), 1):
-                                node_id, tweets, summary = await future
-                                nodes[node_id]["tweets"] = tweets
-                                nodes[node_id]["tweet_summary"] = summary
-                                
-                                # Update progress more frequently
-                                progress = i / len(top_accounts)
-                                progress_bar.progress(progress)
-                                status_text.text(f"Processed {i}/{len(top_accounts)} accounts")
-                                
-                                # Add immediate visual feedback
-                                st.write(f"✅ Summarized tweets for @{nodes[node_id]['screen_name']}")
-                            
-                            # Complete progress
-                            progress_bar.progress(1.0)
-                            status_text.text("Tweet summarization complete!")
-                            
-                            # Update session state with new data
-                            st.session_state.network_data = (nodes, edges)
-                            
-                            # Force a rerun to update the display
-                            st.rerun()
                     
                     # Run the async function
                     asyncio.run(summarize_top_accounts())
@@ -1936,26 +1905,16 @@ async def classify_accounts_with_tweets(accounts, community_labels):
     if not accounts_to_classify:
         return {}
     
-    # Format account data for the prompt
-    accounts_text = []
-    for i, account in enumerate(accounts_to_classify):
-        screen_name = account["screen_name"]
-        description = account["description"]
-        tweet_summary = account.get("tweet_summary", "")
-        
-        account_text = f"Account {i+1} (@{screen_name}):\n"
-        account_text += f"Bio: {description}\n"
-        if tweet_summary:
-            account_text += f"Tweet Summary: {tweet_summary}\n"
-        accounts_text.append(account_text)
-    
-    # Divide into chunks if too many accounts
-    max_accounts_per_call = 100
-    chunks = [accounts_to_classify[i:i+max_accounts_per_call] 
-              for i in range(0, len(accounts_to_classify), max_accounts_per_call)]
+    # Get valid community IDs
+    valid_community_ids = set(community_labels.keys())
     
     # Format community labels for the prompt
     community_desc = "\n".join([f"- Community {cid}: {label}" for cid, label in community_labels.items()])
+    
+    # Process in chunks
+    max_accounts_per_call = 100
+    chunks = [accounts_to_classify[i:i+max_accounts_per_call] 
+              for i in range(0, len(accounts_to_classify), max_accounts_per_call)]
     
     # Process each chunk
     results = {}
@@ -1963,8 +1922,18 @@ async def classify_accounts_with_tweets(accounts, community_labels):
     
     for i, chunk in enumerate(chunks):
         # Create prompt for this chunk
-        chunk_screen_names = [account["screen_name"] for account in chunk]
-        chunk_texts = [accounts_text[accounts_to_classify.index(account)] for account in chunk]
+        chunk_texts = []
+        for account in chunk:
+            screen_name = account["screen_name"]
+            description = account["description"]
+            tweet_summary = account.get("tweet_summary", "")
+            
+            account_text = f"Account (@{screen_name}):\n"
+            account_text += f"Bio: {description}\n"
+            if tweet_summary:
+                account_text += f"Tweet Summary: {tweet_summary}\n"
+            chunk_texts.append(account_text)
+        
         chunk_formatted = "\n".join(chunk_texts)
         
         prompt = f"""I have a set of Twitter accounts that I need to classify into predefined communities.
@@ -1974,14 +1943,16 @@ The communities are:
 
 Please classify each of the following accounts into one of these communities based on their bio and tweet content.
 Be thorough in your analysis of each account's content and assign it to the most appropriate community.
+IMPORTANT: Only use the exact community IDs provided above. Do not create new community IDs.
+If an account doesn't fit well into any specific community, assign it to the "Other" category.
 
 Accounts to classify:
 {chunk_formatted}
 
 Provide your answer as a JSON object mapping the Twitter username (without @) to the community ID (as a string). For example:
 {{
-  "username1": "0",  // For community "{list(community_labels.items())[0][1] if community_labels else 'Example'}"
-  "username2": "1",  // For community "{list(community_labels.items())[1][1] if len(community_labels) > 1 else 'Example'}"
+  "username1": "{list(community_labels.keys())[0]}",  // For community "{list(community_labels.values())[0]}"
+  "username2": "{list(community_labels.keys())[1] if len(community_labels) > 1 else list(community_labels.keys())[0]}"  // For community "{list(community_labels.values())[1] if len(community_labels) > 1 else list(community_labels.values())[0]}"
 }}
 """
         
@@ -1991,7 +1962,7 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that analyzes Twitter accounts."},
+                    {"role": "system", "content": "You are a helpful assistant that analyzes Twitter accounts. Only use the exact community IDs provided."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3
@@ -2007,11 +1978,20 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
                     json_str = json_match.group(1)
                     chunk_results = json.loads(json_str)
                     
-                    # Add to overall results
+                    # Validate and clean results
                     for username, community in chunk_results.items():
                         if username.startswith('@'):
                             username = username[1:]  # Remove @ if present
-                        results[username] = community
+                        
+                        # Ensure community ID is valid
+                        if community in valid_community_ids:
+                            results[username] = community
+                        else:
+                            # Assign to "Other" category or first available community
+                            other_community = next((cid for cid, label in community_labels.items() 
+                                                  if label.lower() == "other"), list(community_labels.keys())[0])
+                            results[username] = other_community
+                            st.warning(f"Invalid community ID {community} assigned to @{username}. Reassigning to {community_labels[other_community]}.")
                 else:
                     st.warning(f"Could not extract JSON from chunk {i+1} response")
             except json.JSONDecodeError:
@@ -2023,7 +2003,6 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
         # Update progress
         progress_bar.progress((i+1)/len(chunks))
     
-    # Return the mapping of screen_names to community IDs
     return results
 
 # First, let's fix the visualization coloring function to use proper labels
@@ -2047,6 +2026,66 @@ def get_node_colors(nodes, node_communities, community_colors):
             node_colors[node_id] = "#cccccc"
     
     return node_colors
+
+async def summarize_top_accounts():
+    """Process tweet summarization with improved connection handling"""
+    st.write("Starting tweet summarization process...")
+    
+    # Increase concurrency but still maintain reasonable limits for Streamlit Cloud
+    conn = aiohttp.TCPConnector(limit=20, force_close=True, ttl_dns_cache=300)
+    timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
+    
+    try:
+        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Process accounts in medium-sized batches
+            batch_size = 10  # Increased from 5 to 10
+            for i in range(0, len(top_accounts), batch_size):
+                batch = top_accounts[i:i + batch_size]
+                
+                # Create tasks for current batch
+                tasks = []
+                for node_id, _, node in batch:
+                    task = fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1)
+                    tasks.append(task)
+                
+                # Process batch with shorter timeout
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Handle results
+                for result in batch_results:
+                    if isinstance(result, tuple):  # Successful result
+                        node_id, tweets, summary = result
+                        nodes[node_id]["tweets"] = tweets
+                        nodes[node_id]["tweet_summary"] = summary
+                    else:  # Exception occurred
+                        st.error(f"Error in batch processing: {str(result)}")
+                
+                # Update progress
+                progress = (i + len(batch)) / len(top_accounts)
+                progress_bar.progress(progress)
+                status_text.text(f"Processed {i + len(batch)}/{len(top_accounts)} accounts")
+                
+                # Reduced delay between batches since we have good API limits
+                await asyncio.sleep(0.5)
+            
+            # Complete progress
+            progress_bar.progress(1.0)
+            status_text.text("Tweet summarization complete!")
+            
+            # Update session state
+            st.session_state.network_data = (nodes, edges)
+            
+            # Force a rerun to update the display
+            st.rerun()
+    
+    except Exception as e:
+        st.error(f"Error in tweet summarization: {str(e)}")
+    finally:
+        # Ensure connector is closed
+        await conn.close()
 
 if __name__ == "__main__":
     main()

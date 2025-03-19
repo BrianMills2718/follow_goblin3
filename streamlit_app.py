@@ -48,7 +48,7 @@ RAPIDAPI_HOST = "twitter283.p.rapidapi.com"  # Updated API host
 
 # Add these constants after the existing RAPIDAPI constants
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
+#OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 COMMUNITY_COLORS = {}  # Will be populated dynamically
 
 async def get_following_async(screenname: str, session: aiohttp.ClientSession, cursor=None):

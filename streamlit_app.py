@@ -314,15 +314,15 @@ async def fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1):
     username = node["screen_name"]
     
     try:
-        # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
-        tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
-        
-        # Generate summary if tweets were found
-        summary = "No tweets available"
-        if tweets:
-            summary = await generate_tweet_summary(tweets, username)
-        
-        return (node_id, tweets, summary)
+    # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
+    tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
+    
+    # Generate summary if tweets were found
+    summary = "No tweets available"
+    if tweets:
+        summary = await generate_tweet_summary(tweets, username)
+    
+    return (node_id, tweets, summary)
     except Exception as e:
         st.error(f"Error processing tweets for @{username}: {str(e)}")
         return (node_id, [], f"Error fetching tweets: {str(e)}")
@@ -570,8 +570,12 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
         size_factors = {
             'base_size': 5,
             'importance_factor': 3.0,
-            'label_size_factor': 1.0
+            'label_size_factor': 1.0,
+            'use_followers_count': True  # New parameter with default value
         }
+
+    # Get the use_followers_count setting
+    use_followers_count = size_factors.get('use_followers_count', True)
 
     # Determine node importance
     in_degrees = {node_id: 0 for node_id in nodes.keys()}
@@ -618,13 +622,21 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
             base_size = float(size_factors.get('base_size', 5))
             importance_factor = float(size_factors.get('importance_factor', 3.0))
             
-            # Handle None values for followers_count
-            followers_count = meta.get("followers_count")
-            if followers_count is None:
-                followers_count = 0 if node_id.startswith("orig_") else 1000  # Default value for non-original nodes
-            
-            # Calculate node size with type checking
-            followers_factor = float(followers_count) / 1000.0
+            # If use_followers_count is enabled, scale nodes by their followers count
+            # Otherwise, use a fixed value for all nodes
+            if use_followers_count:
+                # Handle None values for followers_count
+                followers_count = meta.get("followers_count")
+                if followers_count is None:
+                    followers_count = 1000  # Use same default for all nodes, including original
+                
+                # Calculate node size with type checking
+                followers_factor = float(followers_count) / 1000.0
+            else:
+                # Use a fixed factor for all nodes when followers count scaling is disabled
+                followers_factor = 1.0
+                
+            # Calculate final node size
             node_size = base_size + followers_factor * importance_factor
             
             # Ensure node_size is positive
@@ -806,6 +818,18 @@ def build_network_2d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
     pagerank = compute_pagerank(nodes, edges)
     importance = pagerank if use_pagerank else in_degrees
     
+    # Set default size factors if None
+    if size_factors is None:
+        size_factors = {
+            'base_size': 5,
+            'importance_factor': 3.0,
+            'label_size_factor': 1.0,
+            'use_followers_count': True
+        }
+    
+    # Get the use_followers_count setting
+    use_followers_count = size_factors.get('use_followers_count', True)
+    
     # Find original node and followed nodes
     original_id = next(id for id in nodes.keys() if id.startswith("orig_"))
     followed_by_original = {tgt for src, tgt in edges if src == original_id}
@@ -836,8 +860,19 @@ def build_network_2d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
     
     # Add nodes
     for node_id in selected_nodes:
+        # If use_followers_count is enabled, scale by followers; otherwise use fixed scaling
+        if use_followers_count:
+            followers = nodes[node_id].get('followers_count')
+            # Use consistent default value for all nodes
+            if followers is None:
+                followers = 1000
+            followers_factor = followers / 1000.0
+        else:
+            followers_factor = 1.0
+            
+        # Calculate node size
         size = (size_factors['base_size'] +
-                normalized_importance[node_id] * size_factors['importance_factor'] * 20)
+                followers_factor * size_factors['importance_factor'] * normalized_importance[node_id] * 20)
         
         # Safely format numeric values by checking for None
         followers = nodes[node_id].get('followers_count')
@@ -1117,6 +1152,13 @@ def main():
         help="Controls how much account importance affects node size in the visualization. Higher values make important accounts appear larger."
     )
     
+    # Add toggle for using followers count in node sizing
+    use_followers_count = st.sidebar.checkbox(
+        "Scale Nodes by Followers Count", 
+        value=True,
+        help="When enabled, nodes are scaled based on their Twitter followers count. When disabled, all nodes use the same base scaling factor regardless of followers."
+    )
+    
     # Label size control with number_input
     label_size = 1.0  # Default value
     if st.session_state.network_data is not None:
@@ -1343,7 +1385,7 @@ def main():
                     community = st.session_state.node_communities[username]
                     # Add safety check for community ID
                     if community in st.session_state.community_colors:
-                        filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
+                    filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
                     else:
                         # Assign default color for unknown communities
                         st.warning(f"Community {community} not found in color mapping for user @{username}. Assigning to 'Other' category.")
@@ -1357,7 +1399,8 @@ def main():
         size_factors = {
             'base_size': 1.0,  # Fixed value
             'importance_factor': float(account_size_factor),
-            'label_size_factor': float(label_size)
+            'label_size_factor': float(label_size),
+            'use_followers_count': use_followers_count  # Add the new parameter
         }
         
         # Display the graph
@@ -2080,7 +2123,7 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
                         
                         # Normal case - ensure community ID is valid
                         if community in valid_community_ids:
-                            results[username] = community
+                        results[username] = community
                         else:
                             # If community ID is invalid, assign to "Other" category if it exists
                             other_community = next((cid for cid, label in community_labels.items() 
@@ -2256,4 +2299,3 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
 
 if __name__ == "__main__":
     main()
-    

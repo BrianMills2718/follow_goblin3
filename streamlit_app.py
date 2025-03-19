@@ -46,9 +46,6 @@ st.set_page_config(layout="wide", page_title="X Network Analysis", page_icon="ðŸ
 RAPIDAPI_KEY = st.secrets["RAPIDAPI_KEY"]
 RAPIDAPI_HOST = "twitter283.p.rapidapi.com"  # Updated API host
 
-# Add the alternative Twitter API host for user profile information
-TWITTER_ALT_HOST = st.secrets["TWITTER_ALT_HOST"]  # For fetching user profiles
-
 # Add these constants after the existing RAPIDAPI constants
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 #OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
@@ -161,7 +158,7 @@ async def main_async(input_username: str, following_pages=2, second_degree_pages
     nodes, edges = {}, []
     original_id = f"orig_{input_username}"
     
-    # The original node: minimal attributes (to be updated with real data)
+    # The original node: minimal attributes
     nodes[original_id] = {
         "screen_name": input_username,
         "name": input_username,
@@ -188,24 +185,6 @@ async def main_async(input_username: str, following_pages=2, second_degree_pages
     
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50)) as session:
-            # Step 0: Fetch metadata for the original account
-            status_text.text(f"Fetching profile information for @{input_username}...")
-            original_profile = await get_user_profile_async(input_username, session)
-            
-            if original_profile:
-                # Update the original node with real metadata
-                for key, value in original_profile.items():
-                    nodes[original_id][key] = value
-                
-                # Calculate ratio
-                followers = original_profile.get("followers_count", 0)
-                friends = original_profile.get("friends_count", 0)
-                nodes[original_id]["ratio"] = compute_ratio(followers, friends)
-                
-                # Update progress
-                progress.progress(0.05)
-                status_text.text(f"Retrieved profile for @{input_username} with {followers:,} followers")
-            
             # Step 1: Get following for original account with pagination
             status_text.text("Fetching accounts followed by original user...")
             first_hop_accounts = []
@@ -642,7 +621,7 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
             # Handle None values for followers_count
             followers_count = meta.get("followers_count")
             if followers_count is None:
-                followers_count = 1000  # Use same default for all nodes including original
+                followers_count = 0 if node_id.startswith("orig_") else 1000  # Default value for non-original nodes
             
             # Calculate node size with type checking
             followers_factor = float(followers_count) / 1000.0
@@ -2274,47 +2253,6 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
     finally:
         # Ensure connector is closed
         await conn.close()
-
-async def get_user_profile_async(screenname: str, session: aiohttp.ClientSession):
-    """
-    Asynchronously retrieve user profile information for the original account
-    using the alternate Twitter API endpoint.
-    """
-    endpoint = f"/screenname.php?screenname={screenname}"
-    
-    url = f"https://{TWITTER_ALT_HOST}{endpoint}"
-    headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": TWITTER_ALT_HOST}
-    
-    try:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                st.error(f"Failed to get user profile for {screenname}: {response.status}")
-                return None
-            data = await response.text()
-            user_data = json.loads(data)
-            
-            # Format the data to match the structure used for following accounts
-            account = {
-                "screen_name": user_data.get("profile", screenname),
-                "name": user_data.get("name", screenname),
-                "followers_count": user_data.get("sub_count", 0),
-                "friends_count": user_data.get("friends", 0),
-                "statuses_count": user_data.get("statuses_count", 0),
-                "media_count": user_data.get("media_count", 0),
-                "created_at": user_data.get("created_at", ""),
-                "location": user_data.get("location", ""),
-                "blue_verified": user_data.get("blue_verified", False),
-                "verified": user_data.get("blue_verified", False),
-                "website": "",  # Not provided in this endpoint response
-                "business_account": user_data.get("business_account", False),
-                "description": user_data.get("desc", ""),
-                "ratio": 0  # Will be computed later
-            }
-            
-            return account
-    except Exception as e:
-        st.error(f"Error fetching user profile: {str(e)}")
-        return None
 
 if __name__ == "__main__":
     main()

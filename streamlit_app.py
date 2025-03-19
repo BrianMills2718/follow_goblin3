@@ -314,15 +314,15 @@ async def fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1):
     username = node["screen_name"]
     
     try:
-        # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
-        tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
-        
-        # Generate summary if tweets were found
-        summary = "No tweets available"
-        if tweets:
-            summary = await generate_tweet_summary(tweets, username)
-        
-        return (node_id, tweets, summary)
+    # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
+    tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
+    
+    # Generate summary if tweets were found
+    summary = "No tweets available"
+    if tweets:
+        summary = await generate_tweet_summary(tweets, username)
+    
+    return (node_id, tweets, summary)
     except Exception as e:
         st.error(f"Error processing tweets for @{username}: {str(e)}")
         return (node_id, [], f"Error fetching tweets: {str(e)}")
@@ -1343,7 +1343,7 @@ def main():
                     community = st.session_state.node_communities[username]
                     # Add safety check for community ID
                     if community in st.session_state.community_colors:
-                        filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
+                    filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
                     else:
                         # Assign default color for unknown communities
                         st.warning(f"Community {community} not found in color mapping for user @{username}. Assigning to 'Other' category.")
@@ -1464,11 +1464,9 @@ def main():
                         community_colors = {community_id: color for community_id, color in 
                                           zip(community_labels.keys(), color_list)}
                         
-                        # Changed: Classify ALL accounts with tweets, not just filtered ones
-                        # This ensures all nodes get communities assigned consistently with tweet summarization
-                        all_nodes_list = list(nodes.values())
+                        # Only classify the filtered/displayed nodes
                         node_communities = asyncio.run(classify_accounts_with_tweets(
-                            all_nodes_list,
+                            list(filtered_nodes.values()),
                             community_labels
                         ))
                         
@@ -1917,8 +1915,8 @@ async def classify_accounts_with_tweets(accounts, community_labels):
     other_community_id = next((cid for cid, label in community_labels.items() 
                             if label.lower() == "other"), list(community_labels.keys())[0])
     
-    # Process in chunks
-    max_accounts_per_call = 100
+    # Process in chunks - CHANGED from 100 to 50
+    max_accounts_per_call = 50
     chunks = [accounts_to_classify[i:i+max_accounts_per_call] 
               for i in range(0, len(accounts_to_classify), max_accounts_per_call)]
     
@@ -2004,7 +2002,7 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
                         
                         # Normal case - ensure community ID is valid
                         if community in valid_community_ids:
-                            results[username] = community
+                        results[username] = community
                         else:
                             # If community ID is invalid, assign to "Other" category if it exists
                             other_community = next((cid for cid, label in community_labels.items() 
@@ -2047,13 +2045,12 @@ def get_node_colors(nodes, node_communities, community_colors):
     return node_colors
 
 async def summarize_top_accounts(top_accounts, nodes, edges):
-    """Process tweet summarization with adaptive concurrency to find optimal performance"""
+    """Process tweet summarization with adaptive concurrency and batch processing"""
     st.write("Starting tweet summarization process...")
     
     # Start with a conservative limit that we know works
-    initial_concurrency = 10
-    max_concurrency = 15  # Maximum to try
-    concurrency_limit = initial_concurrency
+    concurrency_limit = 10
+    batch_size = 5  # Process 5 accounts in a single API call
     
     # Create a session-level variable to track failures
     if 'fd_failures' not in st.session_state:
@@ -2061,7 +2058,7 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
     
     # If we've had failures, reduce the limit
     if st.session_state.fd_failures > 0:
-        concurrency_limit = max(5, initial_concurrency - st.session_state.fd_failures)
+        concurrency_limit = max(5, concurrency_limit - st.session_state.fd_failures)
         st.warning(f"Reducing concurrency to {concurrency_limit} due to previous failures")
     
     semaphore = asyncio.Semaphore(concurrency_limit)
@@ -2073,64 +2070,94 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
     # Counter for failures within this run
     failures_this_run = 0
     
-    # Wrap the fetch function with semaphore control and failure tracking
-    async def fetch_with_semaphore(node_id, node):
-        nonlocal failures_this_run
+    # Fetch tweets for a batch of accounts
+    async def fetch_tweets_for_batch(account_batch):
+        tweet_data = []
+        
+        for node_id, _, node in account_batch:
+            username = node["screen_name"]
+            try:
+                tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
+                tweet_data.append((username, tweets))
+            except Exception as e:
+                nonlocal failures_this_run
+                failures_this_run += 1
+                st.error(f"Error fetching tweets for @{username}: {str(e)}")
+                tweet_data.append((username, []))
+                
+        return tweet_data
+    
+    # Process a batch of accounts with semaphore
+    async def process_account_batch(batch_idx, account_batch):
         async with semaphore:
             try:
-                return await fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1)
+                # Fetch tweets for all accounts in the batch
+                tweet_data = await fetch_tweets_for_batch(account_batch)
+                
+                # Generate summaries for the batch in a single API call
+                summaries = await generate_batch_tweet_summaries(tweet_data, batch_size)
+                
+                # Update the nodes with summaries
+                results = []
+                for i, (node_id, _, node) in enumerate(account_batch):
+                    username = node["screen_name"]
+                    tweets = tweet_data[i][1] if i < len(tweet_data) else []
+                    summary = summaries.get(username, "No summary available")
+                    
+                    # Update the node
+                    nodes[node_id]["tweets"] = tweets
+                    nodes[node_id]["tweet_summary"] = summary
+                    
+                    # Add to results
+                    results.append((username, len(tweets) > 0, "Success"))
+                
+                return batch_idx, results
+                
             except Exception as e:
-                error_msg = str(e)
+                nonlocal failures_this_run
                 failures_this_run += 1
-                if "File descriptor" in error_msg:
-                    st.error(f"File descriptor error detected. Will reduce concurrency next time.")
-                    st.session_state.fd_failures += 1
-                st.error(f"Error processing tweets for @{node['screen_name']}: {error_msg}")
-                return (node_id, [], f"Error: {error_msg}")
+                st.error(f"Error processing batch {batch_idx}: {str(e)}")
+                return batch_idx, [(node["screen_name"], False, f"Error: {str(e)}") for _, _, node in account_batch]
     
     try:
         async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
             progress_bar = st.progress(0)
             status_text = st.empty()
             concurrency_info = st.empty()
-            concurrency_info.info(f"Using concurrency level: {concurrency_limit}")
+            concurrency_info.info(f"Using concurrency level: {concurrency_limit} with batch size: {batch_size}")
             
-            # Create tasks with semaphore control
-            tasks = [fetch_with_semaphore(node_id, node) for node_id, _, node in top_accounts]
+            # Divide accounts into batches of batch_size
+            batches = []
+            for i in range(0, len(top_accounts), batch_size):
+                batches.append((i // batch_size, top_accounts[i:i+batch_size]))
+            
+            # Create tasks for all batches
+            tasks = [process_account_batch(batch_idx, account_batch) for batch_idx, account_batch in batches]
             
             # Show real-time progress as results arrive
-            successful = 0
-            for i, future in enumerate(asyncio.as_completed(tasks), 1):
-                result = await future
+            successful_accounts = 0
+            total_accounts = len(top_accounts)
+            
+            for future in asyncio.as_completed(tasks):
+                batch_idx, results = await future
                 
-                if isinstance(result, tuple):
-                    node_id, tweets, summary = result
-                    if not (isinstance(summary, str) and summary.startswith("Error:")):
-                        successful += 1
-                    nodes[node_id]["tweets"] = tweets
-                    nodes[node_id]["tweet_summary"] = summary
-                    
-                    # Show success message but throttle output
-                    if i % 5 == 0 or i == len(tasks):  # Show every 5th completion or the last one
-                        st.write(f"✅ Processed {i}/{len(tasks)} accounts")
+                # Count successful accounts in this batch
+                batch_successful = sum(1 for _, success, _ in results if success)
+                successful_accounts += batch_successful
+                
+                # Show completion message
+                st.write(f"✅ Processed batch {batch_idx+1}/{len(batches)} ({batch_successful}/{len(results)} accounts successful)")
                 
                 # Update progress
-                progress = i / len(tasks)
+                progress = (batch_idx + 1) / len(batches)
                 progress_bar.progress(progress)
-                status_text.text(f"Processed {i}/{len(tasks)} accounts (Successful: {successful}, Failures: {failures_this_run})")
+                status_text.text(f"Processed {successful_accounts}/{total_accounts} accounts")
             
             # Complete progress
             progress_bar.progress(1.0)
             
-            # Adjust concurrency limit for next time based on success
-            if failures_this_run == 0 and concurrency_limit < max_concurrency:
-                new_limit = min(concurrency_limit + 2, max_concurrency)
-                st.success(f"No failures detected! Increasing concurrency limit to {new_limit} next time")
-                st.session_state.fd_failures = max(0, st.session_state.fd_failures - 1)  # Reduce failure count
-            elif failures_this_run > 0:
-                st.warning(f"Detected {failures_this_run} failures. Current limit might be too high.")
-            
-            status_text.text(f"Tweet summarization complete! Successful: {successful}/{len(tasks)}")
+            # Show completion message
+            status_text.text(f"Tweet summarization complete! Successful: {successful_accounts}/{total_accounts}")
             
             # Update session state
             st.session_state.network_data = (nodes, edges)
@@ -2145,6 +2172,74 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
         # Ensure connector is closed
         await conn.close()
 
+async def generate_batch_tweet_summaries(batch_data, batch_size=5):
+    """Generate summaries for multiple accounts (batch_size) in a single API call"""
+    if not batch_data:
+        return {}
+    
+    # Prepare batch content for the prompt
+    batch_content = []
+    usernames = []
+    
+    # Format each account's tweets
+    for username, tweets in batch_data:
+        usernames.append(username)
+        account_tweets = tweets[:10]  # Limit to 10 tweets per account for brevity
+        tweet_texts = [f"@{username} {tweet['date']}: {tweet['text']}" for tweet in account_tweets]
+        batch_content.extend(tweet_texts)
+        # Add separator between accounts
+        if len(batch_content) > 0:
+            batch_content.append("---")  # Separator between accounts
+    
+    # Remove the last separator
+    if batch_content and batch_content[-1] == "---":
+        batch_content.pop()
+    
+    prompt = f"""Analyze the following tweets from {len(usernames)} different Twitter accounts.
+For EACH account, provide a brief summary (max 50 words) of their main topics, interests, and tone.
+
+Tweets:
+{chr(10).join(batch_content)}
+
+Response format:
+@username1: [brief summary of account 1]
+@username2: [brief summary of account 2]
+...and so on for all accounts
+"""
+
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that analyzes Twitter content. Provide concise summaries for multiple accounts."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=len(usernames) * 100,  # Allow enough tokens for all summaries
+            temperature=0.7
+        )
+        
+        # Parse the response to extract summaries for each account
+        summaries = {}
+        text = response.choices[0].message.content.strip()
+        
+        for line in text.split('\n'):
+            if line.startswith('@') and ':' in line:
+                username, summary = line.split(':', 1)
+                username = username.strip('@').strip()
+                if username in usernames:
+                    summaries[username] = summary.strip()
+        
+        # Ensure all accounts have summaries
+        for username in usernames:
+            if username not in summaries:
+                summaries[username] = "No summary generated"
+        
+        return summaries
+    
+    except Exception as e:
+        st.error(f"Error generating batch summaries: {str(e)}")
+        return {username: f"Error: {str(e)}" for username in usernames}
+
 if __name__ == "__main__":
     main()
-    

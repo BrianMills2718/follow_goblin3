@@ -1961,7 +1961,6 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
   "username3": "{other_community_id}"
 }}
 """
-        
         # Call OpenAI API to classify accounts
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
@@ -2001,7 +2000,7 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
                         
                         # Normal case - ensure community ID is valid
                         if community in valid_community_ids:
-                        results[username] = community
+                            results[username] = community
                         else:
                             # If community ID is invalid, assign to "Other" category if it exists
                             other_community = next((cid for cid, label in community_labels.items() 

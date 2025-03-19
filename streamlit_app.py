@@ -1343,7 +1343,7 @@ def main():
                     community = st.session_state.node_communities[username]
                     # Add safety check for community ID
                     if community in st.session_state.community_colors:
-                    filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
+                        filtered_nodes[node_id]["community_color"] = st.session_state.community_colors[community]
                     else:
                         # Assign default color for unknown communities
                         st.warning(f"Community {community} not found in color mapping for user @{username}. Assigning to 'Other' category.")
@@ -1352,7 +1352,6 @@ def main():
                         other_community = next((cid for cid, label in st.session_state.community_labels.items() 
                                              if label.lower() == "other"), "0")
                         st.session_state.node_communities[username] = other_community
-        
         # Update size_factors dictionary
         size_factors = {
             'base_size': 1.0,  # Fixed value

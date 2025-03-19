@@ -1453,7 +1453,7 @@ def main():
                     elif len(filtered_nodes) < num_communities:
                         st.warning(f"Not enough accounts to form {num_communities} communities. Reduce the number of communities.")
                     else:
-                        # Generate community labels using tweet data
+                        # Generate community labels using tweet data - only use the filtered nodes for defining communities
                         community_labels = asyncio.run(generate_community_labels_with_tweets(
                             list(filtered_nodes.values()),
                             num_communities
@@ -1464,16 +1464,18 @@ def main():
                         community_colors = {community_id: color for community_id, color in 
                                           zip(community_labels.keys(), color_list)}
                         
-                        # CLASSIFY ACCOUNTS INTO COMMUNITIES
+                        # Changed: Classify ALL accounts with tweets, not just filtered ones
+                        # This ensures all nodes get communities assigned consistently with tweet summarization
+                        all_nodes_list = list(nodes.values())
                         node_communities = asyncio.run(classify_accounts_with_tweets(
-                            list(filtered_nodes.values()),
+                            all_nodes_list,
                             community_labels
                         ))
                         
                         # Store results in session state
                         st.session_state.community_colors = community_colors
                         st.session_state.community_labels = community_labels
-                        st.session_state.node_communities = node_communities  # Add this line
+                        st.session_state.node_communities = node_communities
                         
                         # Force a rerun to update the visualization
                         st.rerun()
@@ -2028,63 +2030,104 @@ def get_node_colors(nodes, node_communities, community_colors):
     return node_colors
 
 async def summarize_top_accounts(top_accounts, nodes, edges):
-    """Process tweet summarization with maximum parallelism"""
+    """Process tweet summarization with adaptive concurrency to find optimal performance"""
     st.write("Starting tweet summarization process...")
     
-    # Maximum parallelism for performance
-    conn = aiohttp.TCPConnector(limit=50, force_close=True, ttl_dns_cache=300)
+    # Start with a conservative limit that we know works
+    initial_concurrency = 10
+    max_concurrency = 15  # Maximum to try
+    concurrency_limit = initial_concurrency
+    
+    # Create a session-level variable to track failures
+    if 'fd_failures' not in st.session_state:
+        st.session_state.fd_failures = 0
+    
+    # If we've had failures, reduce the limit
+    if st.session_state.fd_failures > 0:
+        concurrency_limit = max(5, initial_concurrency - st.session_state.fd_failures)
+        st.warning(f"Reducing concurrency to {concurrency_limit} due to previous failures")
+    
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    
+    # Configure connection with limits
+    conn = aiohttp.TCPConnector(limit=concurrency_limit, force_close=True, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
+    
+    # Counter for failures within this run
+    failures_this_run = 0
+    
+    # Wrap the fetch function with semaphore control and failure tracking
+    async def fetch_with_semaphore(node_id, node):
+        nonlocal failures_this_run
+        async with semaphore:
+            try:
+                return await fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1)
+            except Exception as e:
+                error_msg = str(e)
+                failures_this_run += 1
+                if "File descriptor" in error_msg:
+                    st.error(f"File descriptor error detected. Will reduce concurrency next time.")
+                    st.session_state.fd_failures += 1
+                st.error(f"Error processing tweets for @{node['screen_name']}: {error_msg}")
+                return (node_id, [], f"Error: {error_msg}")
     
     try:
         async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
             progress_bar = st.progress(0)
             status_text = st.empty()
+            concurrency_info = st.empty()
+            concurrency_info.info(f"Using concurrency level: {concurrency_limit}")
             
-            # Process all accounts in a single operation
-            tasks = []
-            for node_id, _, node in top_accounts:
-                task = fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1)
-                tasks.append(task)
+            # Create tasks with semaphore control
+            tasks = [fetch_with_semaphore(node_id, node) for node_id, _, node in top_accounts]
             
-            # Process all tasks concurrently
-            total_tasks = len(tasks)
-            processed = 0
-            
-            # Use as_completed for faster processing (process results as they arrive)
-            for future in asyncio.as_completed(tasks):
-                try:
-                    result = await future
-                    if isinstance(result, tuple):  # Successful result
-                        node_id, tweets, summary = result
-                        nodes[node_id]["tweets"] = tweets
-                        nodes[node_id]["tweet_summary"] = summary
-                        
-                        # Show immediate feedback
-                        st.write(f"✅ Processed @{nodes[node_id]['screen_name']}")
-                except Exception as e:
-                    st.error(f"Error in processing: {str(e)}")
+            # Show real-time progress as results arrive
+            successful = 0
+            for i, future in enumerate(asyncio.as_completed(tasks), 1):
+                result = await future
                 
-                # Update progress after each completion
-                processed += 1
-                progress = processed / total_tasks
+                if isinstance(result, tuple):
+                    node_id, tweets, summary = result
+                    if not (isinstance(summary, str) and summary.startswith("Error:")):
+                        successful += 1
+                    nodes[node_id]["tweets"] = tweets
+                    nodes[node_id]["tweet_summary"] = summary
+                    
+                    # Show success message but throttle output
+                    if i % 5 == 0 or i == len(tasks):  # Show every 5th completion or the last one
+                        st.write(f"✅ Processed {i}/{len(tasks)} accounts")
+                
+                # Update progress
+                progress = i / len(tasks)
                 progress_bar.progress(progress)
-                status_text.text(f"Processed {processed}/{total_tasks} accounts")
+                status_text.text(f"Processed {i}/{len(tasks)} accounts (Successful: {successful}, Failures: {failures_this_run})")
             
             # Complete progress
             progress_bar.progress(1.0)
-            status_text.text("Tweet summarization complete!")
+            
+            # Adjust concurrency limit for next time based on success
+            if failures_this_run == 0 and concurrency_limit < max_concurrency:
+                new_limit = min(concurrency_limit + 2, max_concurrency)
+                st.success(f"No failures detected! Increasing concurrency limit to {new_limit} next time")
+                st.session_state.fd_failures = max(0, st.session_state.fd_failures - 1)  # Reduce failure count
+            elif failures_this_run > 0:
+                st.warning(f"Detected {failures_this_run} failures. Current limit might be too high.")
+            
+            status_text.text(f"Tweet summarization complete! Successful: {successful}/{len(tasks)}")
             
             # Update session state
             st.session_state.network_data = (nodes, edges)
             
-            # Force a rerun to update the display
+            # Force a rerun to update the visualization
             st.rerun()
     
     except Exception as e:
         st.error(f"Error in tweet summarization: {str(e)}")
+        st.session_state.fd_failures += 1  # Increment failure count on overall errors
     finally:
         # Ensure connector is closed
         await conn.close()
 
 if __name__ == "__main__":
     main()
+    

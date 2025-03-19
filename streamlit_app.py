@@ -314,15 +314,15 @@ async def fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1):
     username = node["screen_name"]
     
     try:
-    # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
-    tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
-    
-    # Generate summary if tweets were found
-    summary = "No tweets available"
-    if tweets:
-        summary = await generate_tweet_summary(tweets, username)
-    
-    return (node_id, tweets, summary)
+        # Fetch only one page of tweets for speed (20 tweets is enough for a summary)
+        tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
+        
+        # Generate summary if tweets were found
+        summary = "No tweets available"
+        if tweets:
+            summary = await generate_tweet_summary(tweets, username)
+        
+        return (node_id, tweets, summary)
     except Exception as e:
         st.error(f"Error processing tweets for @{username}: {str(e)}")
         return (node_id, [], f"Error fetching tweets: {str(e)}")

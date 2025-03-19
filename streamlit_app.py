@@ -1440,7 +1440,7 @@ def main():
 
         with col3:
             # Add the new button for tweet-enhanced labels
-            if st.button("Generate Community Labels (Bios and Tweets)"):
+            if st.button("Generate Labels with Tweets"):
                 with st.spinner("Generating community labels from bios and tweets..."):
                     # Check if we have tweet summaries
                     has_tweet_data = any(
@@ -2028,11 +2028,11 @@ def get_node_colors(nodes, node_communities, community_colors):
     return node_colors
 
 async def summarize_top_accounts(top_accounts, nodes, edges):
-    """Process tweet summarization with improved connection handling"""
+    """Process tweet summarization with maximum parallelism"""
     st.write("Starting tweet summarization process...")
     
-    # Increase concurrency but still maintain reasonable limits for Streamlit Cloud
-    conn = aiohttp.TCPConnector(limit=20, force_close=True, ttl_dns_cache=300)
+    # Maximum parallelism for performance
+    conn = aiohttp.TCPConnector(limit=50, force_close=True, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
     
     try:
@@ -2040,36 +2040,35 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # Process accounts in medium-sized batches
-            batch_size = 10  # Increased from 5 to 10
-            for i in range(0, len(top_accounts), batch_size):
-                batch = top_accounts[i:i + batch_size]
-                
-                # Create tasks for current batch
-                tasks = []
-                for node_id, _, node in batch:
-                    task = fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1)
-                    tasks.append(task)
-                
-                # Process batch with shorter timeout
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Handle results
-                for result in batch_results:
+            # Process all accounts in a single operation
+            tasks = []
+            for node_id, _, node in top_accounts:
+                task = fetch_and_summarize_tweets(node_id, node, session, tweet_pages=1)
+                tasks.append(task)
+            
+            # Process all tasks concurrently
+            total_tasks = len(tasks)
+            processed = 0
+            
+            # Use as_completed for faster processing (process results as they arrive)
+            for future in asyncio.as_completed(tasks):
+                try:
+                    result = await future
                     if isinstance(result, tuple):  # Successful result
                         node_id, tweets, summary = result
                         nodes[node_id]["tweets"] = tweets
                         nodes[node_id]["tweet_summary"] = summary
-                    else:  # Exception occurred
-                        st.error(f"Error in batch processing: {str(result)}")
+                        
+                        # Show immediate feedback
+                        st.write(f"✅ Processed @{nodes[node_id]['screen_name']}")
+                except Exception as e:
+                    st.error(f"Error in processing: {str(e)}")
                 
-                # Update progress
-                progress = (i + len(batch)) / len(top_accounts)
+                # Update progress after each completion
+                processed += 1
+                progress = processed / total_tasks
                 progress_bar.progress(progress)
-                status_text.text(f"Processed {i + len(batch)}/{len(top_accounts)} accounts")
-                
-                # Reduced delay between batches since we have good API limits
-                await asyncio.sleep(0.5)
+                status_text.text(f"Processed {processed}/{total_tasks} accounts")
             
             # Complete progress
             progress_bar.progress(1.0)

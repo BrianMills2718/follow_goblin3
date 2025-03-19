@@ -47,7 +47,8 @@ RAPIDAPI_KEY = st.secrets["RAPIDAPI_KEY"]
 RAPIDAPI_HOST = "twitter283.p.rapidapi.com"  # Updated API host
 
 # Add these constants after the existing RAPIDAPI constants
-OPENROUTER_API_KEY = "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"
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 COMMUNITY_COLORS = {}  # Will be populated dynamically
 
 async def get_following_async(screenname: str, session: aiohttp.ClientSession, cursor=None):
@@ -396,7 +397,7 @@ def filter_nodes(nodes, filters):
 # ---------------------------------------------------------------------
 def get_openai_client():
     """Initialize OpenAI client."""
-    return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 async def get_community_labels(accounts: List[Dict], num_communities: int) -> List[str]:
     """Get community labels from GPT-4o-mini."""
@@ -1723,7 +1724,7 @@ async def generate_tweet_summary(tweets, username):
 Summary:"""
 
     try:
-        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        client = OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -1888,7 +1889,7 @@ Ensure labels are specific and descriptive of the accounts' shared interests or 
 
     # Call OpenAI API to generate community labels
     try:
-        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        client = OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -1986,7 +1987,7 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
         
         # Call OpenAI API to classify accounts
         try:
-            client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+            client = OpenAI(api_key=OPENAI_API_KEY)
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[

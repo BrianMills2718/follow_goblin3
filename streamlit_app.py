@@ -46,6 +46,9 @@ st.set_page_config(layout="wide", page_title="X Network Analysis", page_icon="ðŸ
 RAPIDAPI_KEY = st.secrets["RAPIDAPI_KEY"]
 RAPIDAPI_HOST = "twitter283.p.rapidapi.com"  # Updated API host
 
+# Add the alternative Twitter API host for user profile information
+TWITTER_ALT_HOST = st.secrets["TWITTER_ALT_HOST"]  # For fetching user profiles
+
 # Add these constants after the existing RAPIDAPI constants
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 #OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
@@ -158,7 +161,7 @@ async def main_async(input_username: str, following_pages=2, second_degree_pages
     nodes, edges = {}, []
     original_id = f"orig_{input_username}"
     
-    # The original node: minimal attributes
+    # The original node: minimal attributes (to be updated with real data)
     nodes[original_id] = {
         "screen_name": input_username,
         "name": input_username,
@@ -185,6 +188,24 @@ async def main_async(input_username: str, following_pages=2, second_degree_pages
     
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50)) as session:
+            # Step 0: Fetch metadata for the original account
+            status_text.text(f"Fetching profile information for @{input_username}...")
+            original_profile = await get_user_profile_async(input_username, session)
+            
+            if original_profile:
+                # Update the original node with real metadata
+                for key, value in original_profile.items():
+                    nodes[original_id][key] = value
+                
+                # Calculate ratio
+                followers = original_profile.get("followers_count", 0)
+                friends = original_profile.get("friends_count", 0)
+                nodes[original_id]["ratio"] = compute_ratio(followers, friends)
+                
+                # Update progress
+                progress.progress(0.05)
+                status_text.text(f"Retrieved profile for @{input_username} with {followers:,} followers")
+            
             # Step 1: Get following for original account with pagination
             status_text.text("Fetching accounts followed by original user...")
             first_hop_accounts = []
@@ -570,12 +591,8 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
         size_factors = {
             'base_size': 5,
             'importance_factor': 3.0,
-            'label_size_factor': 1.0,
-            'use_followers_count': True  # New parameter with default value
+            'label_size_factor': 1.0
         }
-
-    # Get the use_followers_count setting
-    use_followers_count = size_factors.get('use_followers_count', True)
 
     # Determine node importance
     in_degrees = {node_id: 0 for node_id in nodes.keys()}
@@ -622,21 +639,13 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
             base_size = float(size_factors.get('base_size', 5))
             importance_factor = float(size_factors.get('importance_factor', 3.0))
             
-            # If use_followers_count is enabled, scale nodes by their followers count
-            # Otherwise, use a fixed value for all nodes
-            if use_followers_count:
-                # Handle None values for followers_count
-                followers_count = meta.get("followers_count")
-                if followers_count is None:
-                    followers_count = 1000  # Use same default for all nodes, including original
-                
-                # Calculate node size with type checking
-                followers_factor = float(followers_count) / 1000.0
-            else:
-                # Use a fixed factor for all nodes when followers count scaling is disabled
-                followers_factor = 1.0
-                
-            # Calculate final node size
+            # Handle None values for followers_count
+            followers_count = meta.get("followers_count")
+            if followers_count is None:
+                followers_count = 1000  # Use same default for all nodes including original
+            
+            # Calculate node size with type checking
+            followers_factor = float(followers_count) / 1000.0
             node_size = base_size + followers_factor * importance_factor
             
             # Ensure node_size is positive
@@ -818,18 +827,6 @@ def build_network_2d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
     pagerank = compute_pagerank(nodes, edges)
     importance = pagerank if use_pagerank else in_degrees
     
-    # Set default size factors if None
-    if size_factors is None:
-        size_factors = {
-            'base_size': 5,
-            'importance_factor': 3.0,
-            'label_size_factor': 1.0,
-            'use_followers_count': True
-        }
-    
-    # Get the use_followers_count setting
-    use_followers_count = size_factors.get('use_followers_count', True)
-    
     # Find original node and followed nodes
     original_id = next(id for id in nodes.keys() if id.startswith("orig_"))
     followed_by_original = {tgt for src, tgt in edges if src == original_id}
@@ -860,19 +857,8 @@ def build_network_2d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
     
     # Add nodes
     for node_id in selected_nodes:
-        # If use_followers_count is enabled, scale by followers; otherwise use fixed scaling
-        if use_followers_count:
-            followers = nodes[node_id].get('followers_count')
-            # Use consistent default value for all nodes
-            if followers is None:
-                followers = 1000
-            followers_factor = followers / 1000.0
-        else:
-            followers_factor = 1.0
-            
-        # Calculate node size
         size = (size_factors['base_size'] +
-                followers_factor * size_factors['importance_factor'] * normalized_importance[node_id] * 20)
+                normalized_importance[node_id] * size_factors['importance_factor'] * 20)
         
         # Safely format numeric values by checking for None
         followers = nodes[node_id].get('followers_count')
@@ -1152,13 +1138,6 @@ def main():
         help="Controls how much account importance affects node size in the visualization. Higher values make important accounts appear larger."
     )
     
-    # Add toggle for using followers count in node sizing
-    use_followers_count = st.sidebar.checkbox(
-        "Scale Nodes by Followers Count", 
-        value=True,
-        help="When enabled, nodes are scaled based on their Twitter followers count. When disabled, all nodes use the same base scaling factor regardless of followers."
-    )
-    
     # Label size control with number_input
     label_size = 1.0  # Default value
     if st.session_state.network_data is not None:
@@ -1399,8 +1378,7 @@ def main():
         size_factors = {
             'base_size': 1.0,  # Fixed value
             'importance_factor': float(account_size_factor),
-            'label_size_factor': float(label_size),
-            'use_followers_count': use_followers_count  # Add the new parameter
+            'label_size_factor': float(label_size)
         }
         
         # Display the graph
@@ -2296,6 +2274,47 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
     finally:
         # Ensure connector is closed
         await conn.close()
+
+async def get_user_profile_async(screenname: str, session: aiohttp.ClientSession):
+    """
+    Asynchronously retrieve user profile information for the original account
+    using the alternate Twitter API endpoint.
+    """
+    endpoint = f"/screenname.php?screenname={screenname}"
+    
+    url = f"https://{TWITTER_ALT_HOST}{endpoint}"
+    headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": TWITTER_ALT_HOST}
+    
+    try:
+        async with session.get(url, headers=headers) as response:
+            if response.status != 200:
+                st.error(f"Failed to get user profile for {screenname}: {response.status}")
+                return None
+            data = await response.text()
+            user_data = json.loads(data)
+            
+            # Format the data to match the structure used for following accounts
+            account = {
+                "screen_name": user_data.get("profile", screenname),
+                "name": user_data.get("name", screenname),
+                "followers_count": user_data.get("sub_count", 0),
+                "friends_count": user_data.get("friends", 0),
+                "statuses_count": user_data.get("statuses_count", 0),
+                "media_count": user_data.get("media_count", 0),
+                "created_at": user_data.get("created_at", ""),
+                "location": user_data.get("location", ""),
+                "blue_verified": user_data.get("blue_verified", False),
+                "verified": user_data.get("blue_verified", False),
+                "website": "",  # Not provided in this endpoint response
+                "business_account": user_data.get("business_account", False),
+                "description": user_data.get("desc", ""),
+                "ratio": 0  # Will be computed later
+            }
+            
+            return account
+    except Exception as e:
+        st.error(f"Error fetching user profile: {str(e)}")
+        return None
 
 if __name__ == "__main__":
     main()

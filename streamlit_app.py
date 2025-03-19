@@ -48,7 +48,7 @@ RAPIDAPI_HOST = "twitter283.p.rapidapi.com"  # Updated API host
 
 # Add these constants after the existing RAPIDAPI constants
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-#OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"] you should be able to switch to other llms fairly easily with openrouter if desired
+#OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 COMMUNITY_COLORS = {}  # Will be populated dynamically
 
 async def get_following_async(screenname: str, session: aiohttp.ClientSession, cursor=None):
@@ -1506,8 +1506,8 @@ def main():
                     top_accounts.sort(key=lambda x: x[1], reverse=True)
                     top_accounts = top_accounts[:max_accounts_display]
                     
-                    # Run the async function
-                    asyncio.run(summarize_top_accounts())
+                    # Run the async function with proper parameters
+                    asyncio.run(summarize_top_accounts(top_accounts, nodes, edges))
 
         # THEN Network Analysis (remove duplicated importance scores calculation)
         st.header("Network Analysis")
@@ -2027,7 +2027,7 @@ def get_node_colors(nodes, node_communities, community_colors):
     
     return node_colors
 
-async def summarize_top_accounts():
+async def summarize_top_accounts(top_accounts, nodes, edges):
     """Process tweet summarization with improved connection handling"""
     st.write("Starting tweet summarization process...")
     

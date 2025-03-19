@@ -1993,8 +1993,8 @@ async def classify_accounts_with_tweets(accounts, community_labels):
     other_community_id = next((cid for cid, label in community_labels.items() 
                             if label.lower() == "other"), list(community_labels.keys())[0])
     
-    # Process in smaller chunks for better handling
-    max_accounts_per_call = 50  # Reduced from 100 to 50
+    # Process in chunks
+    max_accounts_per_call = 100
     chunks = [accounts_to_classify[i:i+max_accounts_per_call] 
               for i in range(0, len(accounts_to_classify), max_accounts_per_call)]
     

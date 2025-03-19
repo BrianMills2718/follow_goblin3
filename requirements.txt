@@ -1,0 +1,7 @@
+streamlit
+aiohttp
+numpy
+scipy
+openai
+pyvis
+tqdm 

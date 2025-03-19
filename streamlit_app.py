@@ -1440,7 +1440,7 @@ def main():
 
         with col3:
             # Add the new button for tweet-enhanced labels
-            if st.button("Generate Labels with Tweets"):
+            if st.button("Generate Community Labels (Bios and Tweets)"):
                 with st.spinner("Generating community labels from bios and tweets..."):
                     # Check if we have tweet summaries
                     has_tweet_data = any(

@@ -1845,6 +1845,8 @@ For each account, I'll provide their Twitter bio description and a summary of th
 Please analyze the following accounts and suggest {num_communities} community labels that best categorize these accounts. 
 Consider both their bio descriptions AND their tweet content.
 
+IMPORTANT: One of your community labels MUST be named exactly "Other" for accounts that don't fit well into specific categories.
+
 Accounts:
 {accounts_formatted}
 
@@ -1852,10 +1854,8 @@ Please provide exactly {num_communities} descriptive community labels, each 1-3 
 {{
   "0": "Tech Enthusiasts",
   "1": "Political Commentators",
-  ...
+  "{num_communities-1}": "Other"
 }}
-
-Ensure labels are specific and descriptive of the accounts' shared interests or characteristics.
 """
 
     # Call OpenAI API to generate community labels
@@ -1913,6 +1913,10 @@ async def classify_accounts_with_tweets(accounts, community_labels):
     # Format community labels for the prompt
     community_desc = "\n".join([f"- Community {cid}: {label}" for cid, label in community_labels.items()])
     
+    # Find the "Other" category ID
+    other_community_id = next((cid for cid, label in community_labels.items() 
+                            if label.lower() == "other"), list(community_labels.keys())[0])
+    
     # Process in chunks
     max_accounts_per_call = 100
     chunks = [accounts_to_classify[i:i+max_accounts_per_call] 
@@ -1945,16 +1949,19 @@ The communities are:
 
 Please classify each of the following accounts into one of these communities based on their bio and tweet content.
 Be thorough in your analysis of each account's content and assign it to the most appropriate community.
-IMPORTANT: Only use the exact community IDs provided above. Do not create new community IDs.
-If an account doesn't fit well into any specific community, assign it to the "Other" category.
+
+VERY IMPORTANT: 
+1. You MUST use the COMMUNITY ID (the number) not the label name in your response
+2. The "Other" category (ID: {other_community_id}) should be used for accounts that don't clearly fit into any specific community
 
 Accounts to classify:
 {chunk_formatted}
 
 Provide your answer as a JSON object mapping the Twitter username (without @) to the community ID (as a string). For example:
 {{
-  "username1": "{list(community_labels.keys())[0]}",  // For community "{list(community_labels.values())[0]}"
-  "username2": "{list(community_labels.keys())[1] if len(community_labels) > 1 else list(community_labels.keys())[0]}"  // For community "{list(community_labels.values())[1] if len(community_labels) > 1 else list(community_labels.values())[0]}"
+  "username1": "{list(community_labels.keys())[0]}",
+  "username2": "{list(community_labels.keys())[1] if len(community_labels) > 1 else list(community_labels.keys())[0]}",
+  "username3": "{other_community_id}"
 }}
 """
         
@@ -1985,13 +1992,23 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
                         if username.startswith('@'):
                             username = username[1:]  # Remove @ if present
                         
-                        # Ensure community ID is valid
+                        # Special case for the "Other" category
+                        if community.lower() == "other" or community == "Other":
+                            # Find the community ID for the "Other" label
+                            other_community = next((cid for cid, label in community_labels.items() 
+                                                if label.lower() == "other"), None)
+                            
+                            if other_community:
+                                results[username] = other_community
+                                continue
+                        
+                        # Normal case - ensure community ID is valid
                         if community in valid_community_ids:
                             results[username] = community
                         else:
-                            # Assign to "Other" category or first available community
+                            # If community ID is invalid, assign to "Other" category if it exists
                             other_community = next((cid for cid, label in community_labels.items() 
-                                                  if label.lower() == "other"), list(community_labels.keys())[0])
+                                                if label.lower() == "other"), list(community_labels.keys())[0])
                             results[username] = other_community
                             st.warning(f"Invalid community ID {community} assigned to @{username}. Reassigning to {community_labels[other_community]}.")
                 else:

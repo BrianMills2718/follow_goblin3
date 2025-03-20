@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # ASYNCHRONOUS 3D NETWORK VISUALIZATION OF X ACCOUNT FOLLOWING NETWORK
 #
 # This script retrieves the "following" network of an input X (formerly Twitter) account asynchronously
@@ -9,7 +8,7 @@
 #     - Permanent node labels that scale with node size
 #     - Detailed hover information
 #     - Interactive camera controls and node focusing
-#  2. Node importance calculated using either PageRank or In-Degree
+#  2. Node importance calculated using either CloutRank or In-Degree
 #  3. Configurable node and label sizes
 #  4. Display filters for:
 #     - statuses_count, followers_count, friends_count, media_count
@@ -19,8 +18,10 @@
 #     - website presence
 #     - business account status
 #  5. Paginated tables showing:
-#     - Top accounts by importance (PageRank/In-Degree)
+#     - Top accounts by importance (CloutRank/In-Degree)
 #     - Top independent accounts (not followed by original account)
+
+
 
 
 import streamlit as st
@@ -30,14 +31,17 @@ import aiohttp
 import json
 from pyvis.network import Network
 import datetime
+from datetime import datetime as dt  # Import datetime as dt to avoid confusion
 import numpy as np
 from scipy import sparse
-from openai import OpenAI
+import google.generativeai as genai  # Updated import for Google Generative AI
 from typing import List, Dict
 import colorsys
 import random
 from tqdm import tqdm  # For progress tracking
 import os
+import pandas as pd
+import networkx as nx
 
 # Set page to wide mode - this must be the first Streamlit command
 st.set_page_config(layout="wide", page_title="X Network Analysis", page_icon="🔍")
@@ -46,8 +50,8 @@ st.set_page_config(layout="wide", page_title="X Network Analysis", page_icon="�
 RAPIDAPI_KEY = st.secrets["RAPIDAPI_KEY"]
 RAPIDAPI_HOST = "twitter283.p.rapidapi.com"  # Updated API host
 
-# Add these constants after the existing RAPIDAPI constants
-OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+# Update OpenAI key to Gemini API key
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]  # Use default if not in secrets
 #OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 COMMUNITY_COLORS = {}  # Will be populated dynamically
 
@@ -113,42 +117,107 @@ def compute_ratio(followers_count, friends_count):
     """Compute follower/following ratio; return 0 if denominator is zero."""
     return followers_count / friends_count if friends_count else 0
 
-def compute_pagerank(nodes, edges, damping=0.85, epsilon=1e-8, max_iter=100):
+
+
+
+def compute_cloutrank(nodes, edges, damping=0.85, epsilon=1e-8, max_iter=100, return_contributors=False):
     """
-    Compute PageRank for each node in the network.
+    Compute CloutRank (PageRank) using the network structure with proper contribution tracking.
+    
+    Parameters:
+    - nodes: Dict of node IDs to node data
+    - edges: List of (source, target) edge tuples where source follows target
+    - damping: Damping factor (default: 0.85)
+    - epsilon: Convergence threshold (default: 1e-8)
+    - max_iter: Maximum iterations (default: 100)
+    - return_contributors: Whether to track and return contribution data
+    
+    Returns:
+    - cloutrank_scores: Dict mapping node IDs to CloutRank scores
+    - (optional) incoming_contributions: Dict mapping nodes to their contributors
+    - (optional) outgoing_contributions: Dict mapping nodes to accounts they contribute to
     """
-    # Create node index mapping
-    node_to_index = {node_id: idx for idx, node_id in enumerate(nodes.keys())}
-    n = len(nodes)
+    # Construct the directed graph - edges point from follower to followed
+    G = nx.DiGraph()
+    G.add_nodes_from(nodes.keys())
     
-    # Create adjacency matrix
-    rows, cols = [], []
-    for src, tgt in edges:
-        if src in node_to_index and tgt in node_to_index:
-            rows.append(node_to_index[src])
-            cols.append(node_to_index[tgt])
+    # Add edges, ensuring all node IDs are strings
+    formatted_edges = [(str(src), str(tgt)) for src, tgt in edges]
+    G.add_edges_from(formatted_edges)
     
-    # Create sparse matrix
-    data = np.ones_like(rows)
-    A = sparse.csr_matrix((data, (rows, cols)), shape=(n, n))
+    # Calculate in-degrees and out-degrees
+    in_degrees = {node: G.in_degree(node) for node in G.nodes()}
+    out_degrees = {node: G.out_degree(node) for node in G.nodes()}
     
-    # Normalize adjacency matrix
-    out_degree = np.array(A.sum(axis=1)).flatten()
-    out_degree[out_degree == 0] = 1  # Avoid division by zero
-    A = sparse.diags(1/out_degree) @ A
+    # Identify dangling nodes (nodes with no outgoing edges)
+    dangling_nodes = [node for node, out_degree in out_degrees.items() if out_degree == 0]
     
-    # Initialize PageRank
-    pr = np.ones(n) / n
+    # Compute PageRank using NetworkX's implementation
+    cloutrank_scores = nx.pagerank(G, alpha=damping, max_iter=max_iter, tol=epsilon)
     
-    # Power iteration
-    for _ in range(max_iter):
-        pr_next = (1 - damping) / n + damping * A.T @ pr
-        if np.sum(np.abs(pr_next - pr)) < epsilon:
-            break
-        pr = pr_next
+    # If we don't need to track contributors, just return scores
+    if not return_contributors:
+        return cloutrank_scores
     
-    # Convert back to dictionary
-    return {node_id: pr[idx] for node_id, idx in node_to_index.items()}
+    # Initialize contribution tracking
+    incoming_contributions = {node: {} for node in G.nodes()}  # Who contributes to me
+    outgoing_contributions = {node: {} for node in G.nodes()}  # Who I contribute to
+    
+    # First, handle normal nodes (non-dangling)
+    for node in G.nodes():
+        # Skip dangling nodes, we'll handle them separately
+        if node in dangling_nodes:
+            continue
+            
+        # Get the node's PageRank score
+        node_score = cloutrank_scores.get(node, 0)
+        
+        # Get all accounts this node follows
+        followed_accounts = list(G.successors(node))
+        
+        # Calculate contribution per followed account
+        contribution_per_followed = (damping * node_score) / len(followed_accounts)
+        
+        # Record contributions
+        for followed in followed_accounts:
+            incoming_contributions[followed][node] = contribution_per_followed
+            outgoing_contributions[node][followed] = contribution_per_followed
+    
+    # Then handle dangling nodes - their PageRank is distributed to all nodes
+    for node in dangling_nodes:
+        node_score = cloutrank_scores.get(node, 0)
+        
+        # Dangling nodes distribute to all nodes equally
+        contribution_per_node = (damping * node_score) / G.number_of_nodes()
+        
+        # Record these contributions
+        for target in G.nodes():
+            # Skip self-contributions for clarity
+            if target == node:
+                continue
+                
+            # Add dangling contribution
+            if 'dangling' not in incoming_contributions[target]:
+                incoming_contributions[target]['dangling'] = 0
+            incoming_contributions[target]['dangling'] += contribution_per_node
+            
+            # Track outgoing from dangling node
+            if 'global' not in outgoing_contributions[node]:
+                outgoing_contributions[node]['global'] = 0
+            outgoing_contributions[node]['global'] += contribution_per_node
+    
+    # Finally add random teleportation component
+    teleport_weight = (1 - damping) / G.number_of_nodes()
+    for node in G.nodes():
+        # Each node gets teleportation weight from every node (including itself)
+        for source in G.nodes():
+            if 'teleport' not in incoming_contributions[node]:
+                incoming_contributions[node]['teleport'] = 0
+            incoming_contributions[node]['teleport'] += teleport_weight * cloutrank_scores.get(source, 0)
+    
+    return cloutrank_scores, incoming_contributions, outgoing_contributions
+
+
 
 async def main_async(input_username: str, following_pages=2, second_degree_pages=1, fetch_tweets=False, tweet_pages=1):
     """
@@ -400,39 +469,48 @@ def filter_nodes(nodes, filters):
 # NEW: Build a 3D network visualization using ForceGraph3D.
 # ---------------------------------------------------------------------
 def get_openai_client():
-    """Initialize OpenAI client."""
-    return OpenAI(api_key=OPENAI_API_KEY)
+    """Initialize Gemini client."""
+    # Configure the Gemini API key
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Return the Gemini model
+    return genai.GenerativeModel("gemini-2.0-flash")
 
-async def get_community_labels(accounts: List[Dict], num_communities: int) -> List[str]:
-    """Get community labels from GPT-4o-mini."""
+async def get_community_labels(accounts: List[Dict]) -> List[str]:
+    """Get community labels from Gemini using account descriptions."""
     client = get_openai_client()
     
     # Create prompt with account information
     account_info = "\n".join([
         f"Username: {acc['screen_name']}, Description: {acc['description']}"
-        for acc in accounts[:20]  # Use first 20 accounts as examples
+        for acc in accounts
     ])
     
-    prompt = f"""Based on these X/Twitter accounts and their descriptions:
+    prompt = f"""Analyze these X/Twitter accounts and their descriptions. Create community labels that provide good coverage of the different types of accounts present. Include an "Other" category for accounts that don't fit well into specific groups.
 
+Accounts to analyze:
 {account_info}
 
-Generate exactly {num_communities} distinct community labels that best categorize these and similar accounts.
-Include an "Other" category as one of the {num_communities} labels. Return only the labels, one per line.
-Focus on professional/topical communities rather than demographic categories."""
+Return your response as a JSON object mapping community IDs to labels, like:
+{{
+  "0": "Tech Entrepreneurs",
+  "1": "Political Commentators", 
+  "2": "Other"
+}}"""
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant that categorizes social media accounts into communities."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-    )
-    
-    # Parse response into list of labels
-    labels = [label.strip() for label in response.choices[0].message.content.split('\n') if label.strip()]
-    return labels
+    try:
+        response = client.generate_content(prompt)
+        
+        # Parse response into dictionary of labels
+        response_text = response.text.strip()
+        import re
+        json_match = re.search(r'({[\s\S]*})', response_text)
+        if json_match:
+            json_str = json_match.group(1)
+            return json.loads(json_str)
+        return {}
+    except Exception as e:
+        st.error(f"Error generating community labels: {str(e)}")
+        return {}
 
 async def classify_accounts(accounts: List[Dict], labels: List[str], batch_size=50) -> Dict[str, str]:
     """Classify accounts into communities in parallel batches."""
@@ -485,18 +563,16 @@ username: community_label"""
                 with batch_status:
                     st.write(f"Processing batch {batch_num + 1}...")
                 
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant that classifies social media accounts into predefined communities. Only use the exact community labels provided."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.2,
-                )
+                # Initialize Gemini client
+                genai.configure(api_key=GEMINI_API_KEY)
+                client = genai.GenerativeModel("gemini-2.0-flash")
+                
+                # Generate classifications
+                response = client.generate_content(prompt)
                 
                 # Parse response into dictionary
                 classifications = {}
-                for line in response.choices[0].message.content.split('\n'):
+                for line in response.text.split('\n'):
                     if ':' in line:
                         username, label = line.split(':', 1)
                         label = label.strip()
@@ -565,6 +641,9 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
     Constructs a 3D ForceGraph visualization with permanent labels and hover info.
     Updated to apply max_nodes selection similar to the build_network_2d function.
     """
+    # Debug info
+    st.write(f"DEBUG: Building 3D network with {len(nodes)} nodes, max_nodes={max_nodes}")
+    
     # Set default size factors if None
     if size_factors is None:
         size_factors = {
@@ -573,14 +652,16 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
             'label_size_factor': 1.0
         }
 
-    # Determine node importance
+    # Determine node importance - ALWAYS calculate both metrics
     in_degrees = {node_id: 0 for node_id in nodes.keys()}
     for src, tgt in edges:
         if tgt in in_degrees:
             in_degrees[tgt] += 1
             
-    pagerank = compute_pagerank(nodes, edges)
-    importance = pagerank if use_pagerank else in_degrees
+    cloutrank = compute_cloutrank(nodes, edges)
+    
+    # Choose which metric to use for sizing nodes
+    importance = cloutrank if use_pagerank else in_degrees
 
     # Identify the original node
     original_id = next(id for id in nodes.keys() if id.startswith("orig_"))
@@ -600,20 +681,28 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
         reverse=True
     )[:max_nodes // 2]
 
+    # Create the selected node set
     selected_nodes = {original_id} | {nid for nid, _ in top_overall} | {nid for nid, _ in top_independent}
+    
+    # Debug info - important for troubleshooting
+    st.write(f"DEBUG: Selected {len(selected_nodes)} nodes for visualization (requested max: {max_nodes})")
+    
+    # Store the number of nodes selected in session state for debugging
+    st.session_state.last_selected_node_count = len(selected_nodes)
+    st.session_state.last_max_nodes = max_nodes
 
     # Filter nodes and edges to only include selected nodes
-    nodes = {node_id: meta for node_id, meta in nodes.items() if node_id in selected_nodes}
-    edges = [(src, tgt) for src, tgt in edges if src in selected_nodes and tgt in selected_nodes]
+    filtered_nodes = {node_id: meta for node_id, meta in nodes.items() if node_id in selected_nodes}
+    filtered_edges = [(src, tgt) for src, tgt in edges if src in selected_nodes and tgt in selected_nodes]
 
     nodes_data = []
     links_data = []
 
     # Convert edges to proper format
-    links_data = [{"source": str(src), "target": str(tgt)} for src, tgt in edges]
+    links_data = [{"source": str(src), "target": str(tgt)} for src, tgt in filtered_edges]
 
     # Convert nodes to proper format with additional info
-    for node_id, meta in nodes.items():
+    for node_id, meta in filtered_nodes.items():
         try:
             base_size = float(size_factors.get('base_size', 5))
             importance_factor = float(size_factors.get('importance_factor', 3.0))
@@ -655,6 +744,7 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
                     community in st.session_state.community_labels):
                     community = st.session_state.community_labels[community]
             
+            # FIX: Always store actual CloutRank and In-Degree values separately
             nodes_data.append({
                 "id": str(node_id),
                 "name": str(meta.get("screen_name", "")),
@@ -664,8 +754,9 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
                 "ratio": float(ratio),
                 "size": float(node_size),
                 "description": str(meta.get("description", "")),
-                "pagerank": float(importance.get(node_id, 0)),
-                "indegree": int(in_degrees.get(node_id, 0)),
+                "cloutrank": float(cloutrank.get(node_id, 0)),  # Always use true CloutRank
+                "indegree": int(in_degrees.get(node_id, 0)),  # Always use true In-Degree
+                "importance": float(importance.get(node_id, 0)),  # Selected importance metric
                 "color": community_color
             })
         except Exception as e:
@@ -679,13 +770,17 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
                 "ratio": 0.0,
                 "size": float(size_factors.get('base_size', 5)),
                 "description": "",
-                "pagerank": 0.0,
+                "cloutrank": 0.0,
                 "indegree": 0,
+                "importance": 0.0,
                 "color": "#6ca6cd"
             })
 
     nodes_json = json.dumps(nodes_data)
     links_json = json.dumps(links_data)
+
+    # Update tooltip to correctly show both metrics
+    importance_label = "CloutRank" if use_pagerank else "In-Degree"
 
     html_code = f"""
     <!DOCTYPE html>
@@ -694,7 +789,7 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
         <meta charset="utf-8">
         <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
         <script src="https://unpkg.com/3d-force-graph@1.70.10/dist/3d-force-graph.min.js"></script>
-        <script src="https://unpkg.com/three-spritetext"></script>
+        <script src="https://unpkg.com/three-spritetext@1.6.5/dist/three-spritetext.min.js"></script>
         <style>
           #graph {{ width: 100%; height: 750px; }}
           .node-tooltip {{
@@ -757,8 +852,8 @@ def build_network_3d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
                     Following: ${{node.following.toLocaleString()}}<br/>
                     Ratio: ${{node.ratio.toFixed(2)}}<br/>
                     Description: ${{node.description}}<br/>
-                    PageRank: ${{node.pagerank.toFixed(4)}}<br/>
-                    In-Degree: ${{node.indegree}}
+                    ${importance_label}: ${{node.importance.toFixed(4)}}<br/>
+                    CloutRank: ${{node.cloutrank.toFixed(4)}}
                     </div>`;
             }})
             .linkDirectionalParticles(1)
@@ -797,14 +892,13 @@ def build_network_2d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
     Constructs a 2D network visualization using pyvis.
     Uses the same parameters as build_network_3d for consistency.
     """
-    # Use same importance calculation as 3D version
-    in_degrees = {node_id: 0 for node_id in nodes.keys()}
-    for src, tgt in edges:
-        if tgt in in_degrees:
-            in_degrees[tgt] += 1
+    # Change default from use_pagerank=False to use_clout=True or similar parameter
     
-    pagerank = compute_pagerank(nodes, edges)
-    importance = pagerank if use_pagerank else in_degrees
+    # Compute importance scores based on PageRank or Clout
+    if use_pagerank:
+        importance_scores = compute_pagerank(nodes, edges)
+    else:
+        importance_scores = compute_cloutrank(nodes, edges)
     
     # Find original node and followed nodes
     original_id = next(id for id in nodes.keys() if id.startswith("orig_"))
@@ -812,27 +906,32 @@ def build_network_2d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
     
     # Select nodes same way as 3D version
     top_overall = sorted(
-        [(nid, score) for nid, score in importance.items() 
+        [(nid, score) for nid, score in importance_scores.items() 
          if not nid.startswith("orig_")],
         key=lambda x: x[1],
         reverse=True
     )[:max_nodes//2]
     
     top_independent = sorted(
-        [(nid, score) for nid, score in importance.items() 
+        [(nid, score) for nid, score in importance_scores.items() 
          if not nid.startswith("orig_") and nid not in followed_by_original],
         key=lambda x: x[1],
         reverse=True
     )[:max_nodes//2]
     
+    # Create the selected node set
     selected_nodes = {original_id} | {nid for nid, _ in top_overall} | {nid for nid, _ in top_independent}
+    
+    # Store the number of nodes selected in session state for debugging
+    st.session_state.last_selected_node_count_2d = len(selected_nodes)
+    st.session_state.last_max_nodes_2d = max_nodes
 
     # Create pyvis network
     net = Network(height="750px", width="100%", bgcolor="#222222", font_color="white")
     
     # Normalize importance scores
-    max_importance = max(importance.values())
-    normalized_importance = {nid: score/max_importance for nid, score in importance.items()}
+    max_importance = max(importance_scores.values())
+    normalized_importance = {nid: score/max_importance for nid, score in importance_scores.items()}
     
     # Add nodes
     for node_id in selected_nodes:
@@ -847,9 +946,23 @@ def build_network_2d(nodes, edges, max_nodes=10, size_factors=None, use_pagerank
         ratio = nodes[node_id].get('ratio')
         ratio_str = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "0.00"
         description = nodes[node_id].get('description') or ""
+        
+        # Include both metrics in the tooltip
+        importance_label = "CloutRank" if use_pagerank else "In-Degree"
+        importance_value = importance_scores.get(node_id, 0)
+        importance_str = f"{importance_value:.4f}" if isinstance(importance_value, float) else f"{importance_value}"
+        
+        cloutrank_value = compute_cloutrank(nodes, edges).get(node_id, 0)
+        cloutrank_str = f"{cloutrank_value:.4f}" if isinstance(cloutrank_value, float) else "0.0000"
+        
+        indegree_value = in_degrees.get(node_id, 0)
+        
         title = (f"Followers: {followers_str}\n"
                  f"Following: {friends_str}\n"
                  f"Ratio: {ratio_str}\n"
+                 f"Current Importance ({importance_label}): {importance_str}\n"
+                 f"CloutRank: {cloutrank_str}\n"
+                 f"In-Degree: {indegree_value}\n"
                  f"Description: {description}")
 
         color = nodes[node_id].get("community_color", "#6ca6cd")
@@ -890,6 +1003,7 @@ def create_account_table(accounts_data, start_idx=0, page_size=10, include_tweet
     # Add tweet summary column if requested
     if include_tweets:
         table_data["Tweet Summary"] = []
+        table_data["Fetch Status"] = []  # Add column for fetch status
     
     end_idx = min(start_idx + page_size, len(accounts_data))
     for idx, (_, score, node) in enumerate(accounts_data[start_idx:end_idx], start=start_idx + 1):
@@ -903,6 +1017,9 @@ def create_account_table(accounts_data, start_idx=0, page_size=10, include_tweet
         # Add tweet summary if requested
         if include_tweets:
             table_data["Tweet Summary"].append(node.get("tweet_summary", "No summary available"))
+            # Add fetch status if available
+            fetch_status = node.get("tweet_fetch_status", "")
+            table_data["Fetch Status"].append(fetch_status)
     
     st.table(table_data)
     
@@ -936,8 +1053,21 @@ def get_top_accounts_by_community(nodes: Dict, node_communities: Dict, importanc
     
     return top_accounts
 
-def display_community_tables(top_accounts_by_community, colors, include_tweets=False):
+def display_community_tables(top_accounts_by_community, colors, filtered_nodes, edges, include_tweets=False):
     """Display tables for top accounts in each community."""
+    
+    # Calculate in-degrees
+    in_degrees = {node_id: 0 for node_id in filtered_nodes.keys()}
+    for src, tgt in edges:
+        if tgt in in_degrees:
+            in_degrees[tgt] += 1
+    
+    # Use pre-computed cloutrank if available
+    if 'importance_scores' in st.session_state and isinstance(next(iter(st.session_state.importance_scores.values()), 0), float):
+        cloutrank = st.session_state.importance_scores
+    else:
+        # Calculate on demand only if we have to
+        cloutrank = compute_cloutrank(filtered_nodes, edges)
     
     for community_id, accounts in top_accounts_by_community.items():
         # Skip if no accounts
@@ -947,7 +1077,7 @@ def display_community_tables(top_accounts_by_community, colors, include_tweets=F
         # Get community color and label
         color = colors.get(community_id, "#cccccc")
         
-        # CHANGE: Use descriptive label instead of just "Community X"
+        # Use descriptive label instead of just "Community X"
         if 'community_labels' in st.session_state and st.session_state.community_labels:
             label = st.session_state.community_labels.get(community_id, f"Community {community_id}")
         else:
@@ -959,11 +1089,12 @@ def display_community_tables(top_accounts_by_community, colors, include_tweets=F
             unsafe_allow_html=True
         )
         
-        # Create table data
+        # Create table data with SAME COLUMNS as top_accounts_table
         table_data = {
             "Rank": [],
             "Username": [],
-            "Score": [],
+            "CloutRank": [],        # Always include CloutRank
+            "In-Degree": [],        # Always include In-Degree
             "Followers": [],
             "Following": [],
             "Description": []
@@ -980,21 +1111,56 @@ def display_community_tables(top_accounts_by_community, colors, include_tweets=F
         for idx, (node_id, node, score) in enumerate(show_accounts, 1):
             table_data["Rank"].append(idx)
             table_data["Username"].append(node["screen_name"])
-            table_data["Score"].append(f"{score:.4f}")
+            
+            # Always add both metrics separately
+            cr_value = cloutrank.get(node_id, 0)
+            table_data["CloutRank"].append(f"{cr_value:.4f}")
+            
+            id_value = in_degrees.get(node_id, 0)
+            table_data["In-Degree"].append(str(id_value))
+            
+            # Add other account data
             table_data["Followers"].append(f"{node.get('followers_count', 0):,}")
             table_data["Following"].append(f"{node.get('friends_count', 0):,}")
             table_data["Description"].append(node.get("description", ""))
         
             # Add tweet summary if requested
             if include_tweets:
-                table_data["Tweet Summary"].append(node.get("tweet_summary", "No summary available"))
+                # Get tweet summary with improved formatting
+                tweet_summary = node.get("tweet_summary", "")
+                if tweet_summary and len(tweet_summary) > 0:
+                    # Format it nicely
+                    table_data["Tweet Summary"].append(tweet_summary)
+                else:
+                    table_data["Tweet Summary"].append("No tweet summary available")
         
         # Display table
         st.table(table_data)
 
 def display_top_accounts_table(nodes, edges, importance_scores, original_id, exclude_first_degree=False, include_tweets=False):
     """Display table of top accounts based on importance scores."""
-    st.subheader(f"Top {min(20, len(nodes)-1)} Accounts Overall")
+    # Calculate in-degrees
+    in_degrees = {node_id: 0 for node_id in nodes.keys()}
+    for src, tgt in edges:
+        if tgt in in_degrees:
+            in_degrees[tgt] += 1
+    
+    # Use pre-computed full cloutrank if available
+    if 'full_cloutrank' in st.session_state and st.session_state.importance_metric_mode == "CloutRank":
+        # Use the pre-computed scores from the complete graph
+        cloutrank = st.session_state.full_cloutrank
+    else:
+        # If we're not in CloutRank mode or don't have pre-computed scores, use current scores
+        if isinstance(next(iter(importance_scores.values()), 0), float):
+            cloutrank = importance_scores
+        else:
+            # Only calculate if absolutely necessary
+            cloutrank = compute_cloutrank(nodes, edges)
+    
+    # Get metric name for header
+    importance_metric = st.session_state.get("importance_metric_mode", "In-Degree")
+    
+    st.subheader(f"Top {min(20, len(nodes)-1)} Accounts by {importance_metric}")
     
     # Get direct follows for filtering
     direct_follows = set()
@@ -1018,11 +1184,12 @@ def display_top_accounts_table(nodes, edges, importance_scores, original_id, exc
     # Only show top 20
     accounts = accounts[:20]
     
-    # Create table data
+    # Create table data with both metrics always included
     table_data = {
         "Rank": [],
         "Username": [],
-        "Score": [],
+        "CloutRank": [],        # Always include CloutRank
+        "In-Degree": [],        # Always include In-Degree
         "Followers": [],
         "Following": [],
         "Description": []
@@ -1046,28 +1213,161 @@ def display_top_accounts_table(nodes, edges, importance_scores, original_id, exc
         table_data["Rank"].append(idx)
         table_data["Username"].append(node["screen_name"])
         
-        # Only add community data if communities exist
+        # Add community data if communities exist
         if communities_exist:
-            # Get community label if available
             community_id = communities.get(node["screen_name"], "0")
-            community_label = "N/A"
-            if community_id in community_labels:
-                community_label = community_labels[community_id]
-            else:
-                community_label = f"Community {community_id}"
+            community_label = community_labels.get(community_id, f"Community {community_id}")
             table_data["Community"].append(community_label)
         
-        table_data["Score"].append(f"{score:.4f}")
+        # Always add both metrics separately
+        cr_value = cloutrank.get(node_id, 0)
+        table_data["CloutRank"].append(f"{cr_value:.4f}")
+        
+        id_value = in_degrees.get(node_id, 0)
+        table_data["In-Degree"].append(str(id_value))
+        
+        # Add other account data
         table_data["Followers"].append(f"{node.get('followers_count', 0):,}")
         table_data["Following"].append(f"{node.get('friends_count', 0):,}")
         table_data["Description"].append(node.get("description", ""))
     
         # Add tweet summary if requested
         if include_tweets:
-            table_data["Tweet Summary"].append(node.get("tweet_summary", "No summary available"))
+            tweet_summary = node.get("tweet_summary", "")
+            if tweet_summary and len(tweet_summary) > 0:
+                table_data["Tweet Summary"].append(tweet_summary)
+            else:
+                table_data["Tweet Summary"].append("No tweet summary available")
     
     # Display table
     st.table(table_data)
+
+def create_downloadable_account_table(nodes, edges, include_tweets=False, include_communities=False):
+    """Create a comprehensive downloadable table with all account information."""
+    
+    # Calculate in-degrees for all nodes
+    in_degrees = {node_id: 0 for node_id in nodes.keys()}
+    for src, tgt in edges:
+        if tgt in in_degrees:
+            in_degrees[tgt] += 1
+    
+    # Debug information about the input
+    st.write(f"Debug: create_downloadable_account_table called with {len(nodes)} nodes and {len(edges)} edges")
+    
+    # Use pre-computed cloutrank if available, or calculate with contributors
+    if 'full_cloutrank' in st.session_state and st.session_state.importance_metric_mode == "CloutRank":
+        st.write("Debug: Using pre-computed CloutRank scores")
+        # If we have the cached scores but not contributors, recalculate with contributors
+        if 'cloutrank_contributions' not in st.session_state:
+            st.write("Debug: No cached contributions found, recalculating...")
+            cloutrank, incoming_contribs, outgoing_contribs = compute_cloutrank(nodes, edges, return_contributors=True)
+            st.session_state.cloutrank_contributions = (incoming_contribs, outgoing_contribs)
+        else:
+            st.write("Debug: Using cached CloutRank contributions")
+            cloutrank = st.session_state.full_cloutrank
+            incoming_contribs, outgoing_contribs = st.session_state.cloutrank_contributions
+    else:
+        st.write("Debug: Computing fresh CloutRank scores and contributions")
+        # Calculate from scratch with contributors
+        cloutrank, incoming_contribs, outgoing_contribs = compute_cloutrank(nodes, edges, return_contributors=True)
+        st.session_state.cloutrank_contributions = (incoming_contribs, outgoing_contribs)
+    
+    st.write(f"Debug: Have contributions for {len(incoming_contribs)} nodes")
+    st.write(f"Debug: Total incoming contributions: {sum(len(c) for c in incoming_contribs.values())}")
+    st.write(f"Debug: Total outgoing contributions: {sum(len(c) for c in outgoing_contribs.values())}")
+    
+    # Get communities if available
+    communities = st.session_state.get("node_communities", {}) or {}
+    community_labels = st.session_state.get("community_labels", {}) or {}
+    
+    # Create DataFrame for all accounts
+    data = []
+    processed_nodes = 0
+    nodes_with_contributions = 0
+    
+    for node_id, node in nodes.items():
+        # Skip nodes that might not be complete accounts
+        if not isinstance(node, dict) or "screen_name" not in node:
+            continue
+        
+        processed_nodes += 1
+        
+        # Get community info if available
+        community_id = communities.get(node["screen_name"], "")
+        community_label = community_labels.get(community_id, "") if community_id else ""
+        
+        # Get tweet summary
+        tweet_summary = node.get("tweet_summary", "") if include_tweets else ""
+        
+        # Calculate ratio
+        followers = node.get("followers_count", 0)
+        following = node.get("friends_count", 0)
+        ratio = compute_ratio(followers, following)
+        
+        # Format incoming contributors list
+        node_incoming = incoming_contribs.get(node_id, {})
+        sorted_incoming = sorted(
+            node_incoming.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        incoming_str = "; ".join([
+            f"{nodes[src]['screen_name']} ({contribution:.2f})"
+            for src, contribution in sorted_incoming[:5]  # Show top 5 contributors
+            if src in nodes
+        ])
+        if len(sorted_incoming) > 5:
+            incoming_str += f"; ... ({len(sorted_incoming)-5} more)"
+        
+        # Format outgoing contributions list
+        node_outgoing = outgoing_contribs.get(node_id, {})
+        sorted_outgoing = sorted(
+            node_outgoing.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        outgoing_str = "; ".join([
+            f"{nodes[tgt]['screen_name']} ({contribution:.2f})"
+            for tgt, contribution in sorted_outgoing[:5]  # Show top 5 contributions
+            if tgt in nodes
+        ])
+        if len(sorted_outgoing) > 5:
+            outgoing_str += f"; ... ({len(sorted_outgoing)-5} more)"
+        
+        if incoming_str or outgoing_str:
+            nodes_with_contributions += 1
+        
+        # Add row to data
+        row = {
+            "Screen Name": node["screen_name"],
+            "Name": node.get("name", ""),
+            "CloutRank": cloutrank.get(node_id, 0),
+            "In-Degree": in_degrees.get(node_id, 0),
+            "Followers": followers,
+            "Following": following,
+            "Ratio": ratio,
+            "Tweets": node.get("statuses_count", 0),
+            "Media": node.get("media_count", 0),
+            "Created At": node.get("created_at", ""),
+            "Verified": node.get("verified", False),
+            "Blue Verified": node.get("blue_verified", False),
+            "Business Account": node.get("business_account", False),
+            "Website": node.get("website", ""),
+            "Location": node.get("location", ""),
+            "Community": community_label,
+            "Incoming CloutRank Contributions": incoming_str,
+            "Outgoing CloutRank Contributions": outgoing_str,
+            "Tweet Summary": tweet_summary
+        }
+        data.append(row)
+    
+    st.write(f"Debug: Processed {processed_nodes} nodes, {nodes_with_contributions} had contributions")
+    
+    # Convert to DataFrame and sort by CloutRank
+    df = pd.DataFrame(data)
+    df = df.sort_values("CloutRank", ascending=False)
+    
+    return df
 
 def main():
     # Reset community colors if it's not a dictionary
@@ -1085,6 +1385,8 @@ def main():
         st.session_state.node_communities = None
     if 'use_3d' not in st.session_state:
         st.session_state.use_3d = True
+    if 'cloutrank_contributors' not in st.session_state:
+        st.session_state.cloutrank_contributors = None
 
     st.title("X Account Following Network Visualization")
     st.markdown("Enter an X (formerly Twitter) username to retrieve its following network.")
@@ -1100,11 +1402,11 @@ def main():
     # Dropdown menu for importance metric
     importance_metric = st.sidebar.selectbox(
         "Importance Metric", 
-        options=["In-Degree", "PageRank"],
+        options=["In-Degree", "CloutRank"],
         index=0,
-        help="In-Degree measures importance by how many accounts follow this account in the network. PageRank considers both quantity and quality of connections."
+        help="In-Degree measures importance by how many accounts follow this account in the network. CloutRank considers both quantity and quality of connections."
     )
-    use_pagerank = (importance_metric == "PageRank")
+    use_pagerank = (importance_metric == "CloutRank")
     
     # Replace slider with number_input for direct typing
     account_size_factor = st.sidebar.number_input(
@@ -1141,10 +1443,43 @@ def main():
         "Max Accounts to Display",
         min_value=5,
         max_value=1000,
-        value=50,
+        value=st.session_state.get('max_accounts_display', 50),  # Use session state to remember
         step=5,
         help="Maximum number of accounts to show in the visualization. Lower values improve performance."
     )
+    
+    # Store in session state for persistence
+    st.session_state['max_accounts_display'] = max_accounts_display
+
+    # Add a button to update the visualization - use a SINGLE button with a unique key
+    if st.sidebar.button("Update Visualization", help="Force update the visualization with current settings", key="update_viz_button"):
+        # Create a spinner to show progress
+        with st.spinner("Updating visualization..."):
+            # Store the current value in session state for persistence
+            st.session_state.max_accounts_display = max_accounts_display
+            
+            # Log the value for debugging
+            st.sidebar.info(f"Updating visualization with max {max_accounts_display} accounts")
+            
+            # Force a complete data refresh by getting the full dataset from session state
+            if 'network_data' in st.session_state and st.session_state.network_data:
+                # Get the complete node set
+                all_nodes, all_edges = st.session_state.network_data
+                
+                # Apply tweet data if available
+                if 'all_nodes_with_tweets' in st.session_state:
+                    for node_id, node_data in st.session_state.all_nodes_with_tweets.items():
+                        if node_id in all_nodes and "tweet_summary" in node_data:
+                            all_nodes[node_id]["tweet_summary"] = node_data["tweet_summary"]
+                            all_nodes[node_id]["tweets"] = node_data.get("tweets", [])
+                            all_nodes[node_id]["tweet_fetch_status"] = node_data.get("tweet_fetch_status", "")
+                
+                # Force the visualization to use the updated node set
+                filtered_nodes = all_nodes
+                edges = all_edges
+    
+        # Force a rerun to update the visualization with the new settings
+        st.rerun()
     
     st.sidebar.header("Filter Criteria")
     
@@ -1263,10 +1598,30 @@ def main():
                 following_pages=following_pages,
                 second_degree_pages=second_degree_pages
             )
-        # Add debug information
+            # Add debug information
             st.write(f"Retrieved {len(nodes)} nodes and {len(edges)} edges from API.")
+            
+            # Debug: Print first few nodes and edges
+            st.write("Debug: First few nodes:", list(nodes.keys())[:5])
+            st.write("Debug: First few edges:", edges[:5])
+            
+            # Always compute CloutRank on the full network, regardless of the UI setting
+            with st.spinner("Computing network influence scores on full network..."):
+                st.write("Debug: Starting PageRank computation on full network...")
+                # Force CloutRank mode for the initial calculation
+                st.session_state.importance_metric_mode = "CloutRank"
+                full_cloutrank, incoming_contribs, outgoing_contribs = compute_cloutrank(nodes, edges, return_contributors=True)
+                st.write(f"Debug: PageRank computation complete. Scores computed for {len(full_cloutrank)} nodes")
+                st.write(f"Debug: Found {sum(len(c) for c in incoming_contribs.values())} total incoming contributions")
+                st.write(f"Debug: Found {sum(len(c) for c in outgoing_contribs.values())} total outgoing contributions")
+                
+                # Store results in session state for later use
+                st.session_state.full_cloutrank = full_cloutrank
+                st.session_state.cloutrank_contributions = (incoming_contribs, outgoing_contribs)
+                st.write("Debug: Stored PageRank results in session state")
         
         st.session_state.network_data = (nodes, edges)
+        st.write("Debug: Stored network data in session state")
     
     if st.session_state.network_data is not None:
         nodes, edges = st.session_state.network_data
@@ -1311,9 +1666,17 @@ def main():
             # Create a dictionary to store selected state of communities
             selected_communities = {}
             
-            # Display checkboxes for each community with descriptive labels
+            # Count accounts in each community
+            community_counts = {}
+            for username, comm_id in st.session_state.node_communities.items():
+                if comm_id not in community_counts:
+                    community_counts[comm_id] = 0
+                community_counts[comm_id] += 1
+            
+            # Display checkboxes for each community with descriptive labels and account counts
             for comm_id, label in st.session_state.community_labels.items():
-                comm_label = f"{label} (Community {comm_id})"
+                count = community_counts.get(comm_id, 0)
+                comm_label = f"{label} ({count} accounts)"
                 selected_communities[comm_id] = st.sidebar.checkbox(
                     comm_label,
                     value=True,
@@ -1352,6 +1715,20 @@ def main():
                         other_community = next((cid for cid, label in st.session_state.community_labels.items() 
                                              if label.lower() == "other"), "0")
                         st.session_state.node_communities[username] = other_community
+        
+        # Calculate importance scores based on filtering mode
+        if use_pagerank:
+            # Use the pre-computed scores from the full network
+            importance_scores = st.session_state.full_cloutrank
+        else:
+            importance_scores = {
+            node_id: sum(1 for _, tgt in edges if tgt == node_id)
+            for node_id in filtered_nodes
+        }
+
+        # Also store the mode for reference in display functions
+        st.session_state.importance_metric_mode = "CloutRank" if use_pagerank else "In-Degree"
+        
         # Update size_factors dictionary
         size_factors = {
             'base_size': 1.0,  # Fixed value
@@ -1361,24 +1738,45 @@ def main():
         
         # Display the graph
         if st.session_state.use_3d:
+            # Use session state value if available
+            display_max_accounts = st.session_state.get('max_accounts_display', max_accounts_display)
+            
+            # Show visual feedback on number of accounts being displayed
+            st.info(f"Building 3D visualization with up to {display_max_accounts} accounts")
+            st.write(f"DEBUG: max_accounts_display value = {display_max_accounts}, type = {type(display_max_accounts)}")
+            
             html_code = build_network_3d(
                 filtered_nodes, 
                 edges,
-                max_nodes=max_accounts_display,
+                max_nodes=display_max_accounts,
                 size_factors=size_factors,
                 use_pagerank=use_pagerank
             )
-            st.write("Debug: About to render 3D graph")
+            
+            # Display node count information
+            if 'last_selected_node_count' in st.session_state:
+                st.caption(f"Selected {st.session_state.last_selected_node_count} nodes based on importance")
+            
             components.html(html_code, height=750, width=800)
-            st.write("Debug: Finished rendering")
         else:
+            # Use session state value if available
+            display_max_accounts = st.session_state.get('max_accounts_display', max_accounts_display)
+            
+            # Show visual feedback on number of accounts being displayed
+            st.info(f"Building 2D visualization with up to {display_max_accounts} accounts")
+            
             net = build_network_2d(
                 filtered_nodes, 
                 edges,
-                max_nodes=max_accounts_display,
+                max_nodes=display_max_accounts,
                 size_factors=size_factors,
                 use_pagerank=use_pagerank
             )
+            
+            # Display node count information
+            if 'last_selected_node_count_2d' in st.session_state:
+                st.caption(f"Selected {st.session_state.last_selected_node_count_2d} nodes based on importance")
+            
             net.save_graph("network.html")
             with open("network.html", 'r', encoding='utf-8') as f:
                 components.html(f.read(), height=750, width=800)
@@ -1386,142 +1784,276 @@ def main():
         # Move community color key here, right after the graph
         if st.session_state.community_labels and st.session_state.community_colors:
             st.subheader("Community Color Key")
-            cols = st.columns(len(st.session_state.community_colors))
-            for idx, (comm_id, color) in enumerate(st.session_state.community_colors.items()):
-                with cols[idx]:
-                    # Get descriptive label instead of just community ID
-                    label = st.session_state.community_labels.get(comm_id, f"Community {comm_id}")
-                    st.markdown(
-                        f'<div style="background-color: {color}; padding: 10px; '
-                        f'border-radius: 5px; margin: 2px 0; color: black; '
-                        f'text-align: center;">{label}</div>',
-                        unsafe_allow_html=True
-                    )
+            
+            # Count accounts in each community
+            community_counts = {}
+            for username, comm_id in st.session_state.node_communities.items():
+                if comm_id not in community_counts:
+                    community_counts[comm_id] = 0
+                community_counts[comm_id] += 1
+            
+            # Convert community data to sorted list by labels with account counts
+            community_data = []
+            for comm_id, color in st.session_state.community_colors.items():
+                label = st.session_state.community_labels.get(comm_id, f"Community {comm_id}")
+                count = community_counts.get(comm_id, 0)
+                label_with_count = f"{label} ({count} accounts)"
+                community_data.append((label_with_count, color, comm_id))
+            
+            # Sort alphabetically by label
+            community_data.sort(key=lambda x: x[0])
+            
+            # Calculate number of columns based on total communities
+            num_communities = len(community_data)
+            num_cols = min(4, max(2, 5 - (num_communities // 15)))
+            
+            # Calculate communities per column for even distribution
+            communities_per_col = (num_communities + num_cols - 1) // num_cols if num_communities > 0 else 1
+            
+            # Create a container with fixed height and scrolling
+            st.markdown("""
+            <style>
+            .community-grid {
+                max-height: 400px;
+                overflow-y: auto;
+                padding-right: 10px;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            
+            # Create a grid using Streamlit columns
+            with st.container():
+                st.markdown('<div class="community-grid">', unsafe_allow_html=True)
+                
+                # Create rows of communities instead of columns
+                # This is more reliable than trying to create columns with HTML
+                for i in range(0, num_communities, num_cols):
+                    # Create a row of columns
+                    cols = st.columns(num_cols)
+                    
+                    # Add communities to this row
+                    for j in range(num_cols):
+                        idx = i + j
+                        if idx < num_communities:
+                            label, color, _ = community_data[idx]
+                            with cols[j]:
+                                # Use a simple layout with colored text
+                                st.markdown(
+                                    f'<div style="display:flex; align-items:center">'
+                                    f'<div style="width:15px; height:15px; background-color:{color}; '
+                                    f'border-radius:3px; margin-right:8px;"></div>'
+                                    f'<span style="font-size:0.9em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{label}</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True
+                                )
+                
+                st.markdown('</div>', unsafe_allow_html=True)
 
         # Add community detection controls with tooltips
         st.header("Community Detection")
-        col1, col2, col3 = st.columns(3)  # Add a third column
-
+        col1, col2 = st.columns([2, 1])  # Change to two columns
+        
         with col1:
-            num_communities = st.number_input(
-                "Number of Communities (including 'Other')",
-                min_value=2,
-                max_value=15,
-                value=min(5, len(filtered_nodes)),
-                help="How many distinct communities to identify in the network"
-            )
+            # Combined button for summarizing tweets and generating communities
+            if st.button("Summarize Tweets & Generate Communities", use_container_width=True):
+                # Add a state container to track progress
+                state_container = st.empty()
+                
+                # Step 1: Summarize tweets
+                with st.spinner("Step 1: Summarizing tweets for displayed accounts..."):
+                    state_container.info("Summarizing tweets...")
+                    
+                    # Get the visualization nodes
+                    original_id = next(id for id in filtered_nodes.keys() if id.startswith("orig_"))
+                    followed_by_original = {tgt for src, tgt in edges if src == original_id}
+                    
+                    # Store importance scores in session state to ensure they're available for visualization updates
+                    st.session_state.importance_scores = importance_scores
+                    
+                    # Select top nodes based on importance scores
+                    top_overall = sorted(
+                        [(nid, score) for nid, score in importance_scores.items() 
+                         if not nid.startswith("orig_")],
+                        key=lambda x: x[1],
+                        reverse=True
+                    )[:max_accounts_display // 2]
+                    
+                    top_independent = sorted(
+                        [(nid, score) for nid, score in importance_scores.items()
+                         if not nid.startswith("orig_") and nid not in followed_by_original
+                         and nid not in {n for n, _ in top_overall}],  # Exclude accounts already in top_overall
+                        key=lambda x: x[1],
+                        reverse=True
+                    )[:max_accounts_display // 2]
+                    
+                    # Create list of accounts to process
+                    accounts_to_process = []
+                    
+                    # Debug the selection process
+                    st.write(f"DEBUG: top_overall has {len(top_overall)} accounts")
+                    st.write(f"DEBUG: top_independent has {len(top_independent)} accounts")
+                    st.write(f"DEBUG: Merging these sets and removing duplicates...")
+                    
+                    # Combine the two lists but avoid duplicates by using a dictionary
+                    combined_accounts = {}
+                    for nid, score in top_overall:
+                        combined_accounts[nid] = (nid, score, filtered_nodes[nid])
+                    
+                    for nid, score in top_independent:
+                        if nid not in combined_accounts:  # Only add if not already in the dict
+                            combined_accounts[nid] = (nid, score, filtered_nodes[nid])
+                    
+                    # Convert back to a list
+                    accounts_to_process = list(combined_accounts.values())
+                    
+                    # Add original account if shown
+                    if show_original:
+                        accounts_to_process.append((original_id, 0, filtered_nodes[original_id]))
+                    
+                    # Double-check we have the right number of accounts to match visualization
+                    st.write(f"DEBUG: Selected {len(accounts_to_process)} accounts for tweet summarization")
+                    st.info(f"Summarizing tweets for {len(accounts_to_process)} displayed accounts...")
+                    
+                    # Process the accounts - this updates filtered_nodes with tweet summaries
+                    asyncio.run(summarize_top_accounts(accounts_to_process, filtered_nodes, edges))
+                    
+                    # Ensure nodes variable is fully updated after tweet summarization
+                    if st.session_state.network_data:
+                        # Get updated nodes with tweet summaries
+                        nodes, edges = st.session_state.network_data
+                        # Update filtered_nodes with tweet data from nodes
+                        for node_id in filtered_nodes:
+                            if node_id in nodes and "tweet_summary" in nodes[node_id]:
+                                filtered_nodes[node_id]["tweet_summary"] = nodes[node_id]["tweet_summary"]
+                                filtered_nodes[node_id]["tweets"] = nodes[node_id].get("tweets", [])
+                                filtered_nodes[node_id]["tweet_fetch_status"] = nodes[node_id].get("tweet_fetch_status", "")
+                
+                # Check if we have any tweet summaries
+                has_tweet_data = any(
+                    "tweet_summary" in node and node["tweet_summary"] 
+                    for node_id, node in filtered_nodes.items()
+                )
+                
+                if not has_tweet_data:
+                    state_container.warning("No tweet summaries could be generated. Community generation may be less accurate.")
+                else:
+                    state_container.success(f"Successfully generated tweet summaries for some accounts.")
+                
+                # Step 2: Generate communities based on tweets
+                with st.spinner("Step 2: Generating community labels from bios and tweets..."):
+                    state_container.info("Generating community labels...")
+                    
+                    # Get the visualization nodes using FILTERED_NODES which now has tweet data
+                    original_id = next(id for id in filtered_nodes.keys() if id.startswith("orig_"))
+                    followed_by_original = {tgt for src, tgt in edges if src == original_id}
+                    
+                    # Select top nodes based on importance scores
+                    top_overall = sorted(
+                        [(nid, score) for nid, score in importance_scores.items() 
+                         if not nid.startswith("orig_")],
+                        key=lambda x: x[1],
+                        reverse=True
+                    )[:max_accounts_display // 2]
+                    
+                    top_independent = sorted(
+                        [(nid, score) for nid, score in importance_scores.items()
+                         if not nid.startswith("orig_") and nid not in followed_by_original
+                         and nid not in {n for n, _ in top_overall}],  # Exclude accounts already in top_overall
+                        key=lambda x: x[1],
+                        reverse=True
+                    )[:max_accounts_display // 2]
+                    
+                    selected_nodes = {original_id} | {nid for nid, _ in top_overall} | {nid for nid, _ in top_independent}
+                    visualization_nodes = {node_id: meta for node_id, meta in filtered_nodes.items() 
+                                        if node_id in selected_nodes}
+                    
+                    # Count how many accounts we're actually processing
+                    displayed_account_count = len(visualization_nodes)
+                    
+                    # Always proceed with community generation if possible
+                    if displayed_account_count < 3:  # Minimum needed for community detection
+                        state_container.warning(f"Not enough accounts to form communities. Need at least 3 accounts.")
+                    else:
+                        # Create a container for progress tracking
+                        progress_container = st.container()
+                        with progress_container:
+                            st.write("### Community Generation Progress")
+                            # Display info about the process
+                            st.info(f"Generating communities for {displayed_account_count} displayed accounts...")
+                            
+                            # Calculate appropriate number of communities based on dataset size
+                            base_communities = 3  # Minimum number including "Other"
+                            accounts_per_community = 12  # Target avg accounts per community
+                            calculated_communities = base_communities + len(visualization_nodes) // accounts_per_community
+                            num_communities = min(10, max(3, calculated_communities))
+                            
+                            # Generate community labels
+                            community_labels = asyncio.run(generate_community_labels_with_tweets(
+                                list(visualization_nodes.values()),
+                                num_communities
+                            ))
+                            
+                            # Debug the size of visualization_nodes 
+                            st.write(f"DEBUG: Using {len(visualization_nodes)} accounts for community generation")
+                            
+                            if community_labels:
+                                # Generate colors for communities
+                                color_list = generate_n_colors(len(community_labels))
+                                community_colors = {community_id: make_color_more_distinct(color) 
+                                                 for community_id, color in zip(community_labels.keys(), color_list)}
+                                
+                                # Classify accounts into communities
+                                node_communities = asyncio.run(classify_accounts_with_tweets(
+                                    list(visualization_nodes.values()),
+                                    community_labels
+                                ))
+                                
+                                # Store results in session state
+                                st.session_state.community_labels = community_labels
+                                st.session_state.community_colors = community_colors
+                                st.session_state.node_communities = node_communities
+                                
+                                # Store all nodes with tweet data in session state to ensure they're available for future visualizations
+                                st.session_state.all_nodes_with_tweets = filtered_nodes
+                                
+                                # Set flag to automatically show tweet summaries in tables after successful generation
+                                st.session_state.show_tweet_summaries = True
+                                
+                                # Update state container
+                                state_container.success(f"""
+                                    ✅ Process complete!
+                                    - Generated tweet summaries 
+                                    - Created {len(community_labels)} communities
+                                    - Classified {len(node_communities)} accounts
+                                """)
+                                
+                                # Force a rerun now that both steps are REALLY complete
+                                st.rerun()
+                            else:
+                                state_container.error("Failed to generate community labels. Please try again.")
 
         with col2:
-            # Keep the existing "Generate Community Labels" button (bio-only)
-            if st.button("Generate Community Labels (Bio Only)"):
-                with st.spinner("Generating community labels from account descriptions..."):
-                    # Check if we have enough accounts
-                    if len(filtered_nodes) < num_communities:
-                        st.warning(f"Not enough accounts to form {num_communities} communities. Reduce the number of communities.")
-                    else:
-                        # Generate community labels
-                        community_labels = asyncio.run(generate_community_labels(
-                            list(filtered_nodes.values()),
-                            num_communities
-                        ))
-                        
-                        # Generate community colors as a dictionary mapping community IDs to colors
-                        color_list = generate_n_colors(num_communities)
-                        community_colors = {community_id: color for community_id, color in 
-                                           zip(community_labels.keys(), color_list)}
-                        
-                        # Store results in session state
-                        st.session_state.community_colors = community_colors  # Now it's a dictionary
-                        st.session_state.community_labels = community_labels
-                        
-                        # Force a rerun to update the visualization
-                        st.rerun()
-
-        with col3:
-            # Add the new button for tweet-enhanced labels
-            if st.button("Generate Labels with Tweets"):
-                with st.spinner("Generating community labels from bios and tweets..."):
-                    # Check if we have tweet summaries
-                    has_tweet_data = any(
-                        "tweet_summary" in node and node["tweet_summary"] 
-                        for node_id, node in filtered_nodes.items()
-                    )
-                    
-                    if not has_tweet_data:
-                        st.warning("No tweet summaries found. Please summarize tweets first.")
-                    elif len(filtered_nodes) < num_communities:
-                        st.warning(f"Not enough accounts to form {num_communities} communities. Reduce the number of communities.")
-                    else:
-                        # Generate community labels using tweet data - only use the filtered nodes for defining communities
-                        community_labels = asyncio.run(generate_community_labels_with_tweets(
-                            list(filtered_nodes.values()),
-                            num_communities
-                        ))
-                        
-                        # Generate community colors as a dictionary
-                        color_list = generate_n_colors(num_communities)
-                        community_colors = {community_id: color for community_id, color in 
-                                          zip(community_labels.keys(), color_list)}
-                        
-                        # Only classify the filtered/displayed nodes
-                        node_communities = asyncio.run(classify_accounts_with_tweets(
-                            list(filtered_nodes.values()),
-                            community_labels
-                        ))
-                        
-                        # Store results in session state
-                        st.session_state.community_colors = community_colors
-                        st.session_state.community_labels = community_labels
-                        st.session_state.node_communities = node_communities
-                        
-                        # Force a rerun to update the visualization
-                        st.rerun()
-
-        # Calculate importance scores first so they're available for both sections
-        importance_scores = compute_pagerank(filtered_nodes, edges) if use_pagerank else {
-            node_id: sum(1 for _, tgt in edges if tgt == node_id)
-            for node_id in filtered_nodes
-        }
-
-        # AFTER Community Detection and importance scores, THEN Tweet Analysis
-        st.header("Tweet Analysis")
-        col1, col2 = st.columns(2)
-
-        # Use the max_accounts_display as the number to summarize
-        with col1:
-            st.info(f"Will summarize tweets for top {max_accounts_display} accounts")
-
-        with col2:
-            if st.button("Summarize Tweets for Top Accounts"):
-                with st.spinner("Fetching tweets and generating summaries..."):
-                    # Get top accounts based on importance scores
-                    top_accounts = []
-                    for node_id, node in filtered_nodes.items():
-                        if not node_id.startswith("orig_"):
-                            score = importance_scores.get(node_id, 0)
-                            top_accounts.append((node_id, score, node))
-                    
-                    # Sort by score and limit to same number as visualization
-                    top_accounts.sort(key=lambda x: x[1], reverse=True)
-                    top_accounts = top_accounts[:max_accounts_display]
-                    
-                    # Run the async function with proper parameters
-                    asyncio.run(summarize_top_accounts(top_accounts, nodes, edges))
+            st.info("Communities will be automatically determined based on account descriptions and tweets")
 
         # THEN Network Analysis (remove duplicated importance scores calculation)
         st.header("Network Analysis")
-        
         # Add toggle for showing tweet summaries in tables
         has_tweet_data = any(
             "tweet_summary" in node and node["tweet_summary"] 
             for node_id, node in st.session_state.network_data[0].items()
         )
         
+        # Use the session state flag if available, otherwise use has_tweet_data
+        default_show_summaries = st.session_state.get('show_tweet_summaries', False) or has_tweet_data
+        
         show_tweet_summaries = st.checkbox(
             "Show Tweet Summaries in Tables", 
-            value=has_tweet_data,
+            value=default_show_summaries,
             help="Include AI-generated summaries of tweets in the account tables"
         ) if has_tweet_data else False
+        
+        # Store the current preference back to session state
+        st.session_state.show_tweet_summaries = show_tweet_summaries
         
         # Add toggle for excluding first-degree follows
         exclude_first_degree = st.checkbox(
@@ -1531,6 +2063,19 @@ def main():
         )
         
         # Modify display_top_accounts_table to include tweet summaries
+        st.write(f"DEBUG: show_tweet_summaries = {show_tweet_summaries}")
+        
+        # Check if any nodes have tweet summaries
+        has_summaries = any("tweet_summary" in node and node["tweet_summary"] for node_id, node in filtered_nodes.items())
+        st.write(f"DEBUG: Nodes with tweet summaries: {has_summaries}")
+        
+        if has_summaries:
+            # Show a sample of nodes with summaries
+            summary_nodes = [(node_id, node["screen_name"], node.get("tweet_summary", "None")) 
+                           for node_id, node in filtered_nodes.items() 
+                           if "tweet_summary" in node and node["tweet_summary"]][:3]
+            st.write(f"DEBUG: Sample summaries: {summary_nodes}")
+        
         display_top_accounts_table(
             filtered_nodes,
             edges,
@@ -1558,8 +2103,49 @@ def main():
             display_community_tables(
                 top_accounts, 
                 st.session_state.community_colors,
+                filtered_nodes,  # Pass the filtered nodes
+                edges,           # Pass the edges
                 include_tweets=show_tweet_summaries
             )
+
+    # Removed duplicate Update Visualization button to fix the StreamlitDuplicateElementId error
+
+    # Add a download button for the full account data
+    st.sidebar.markdown("---")  # Separator
+    st.sidebar.header("Export Data")
+    
+    if st.session_state.network_data is not None:
+        nodes, edges = st.session_state.network_data
+        st.write("Debug: Creating downloadable table...")
+        st.write(f"Debug: Using network data with {len(nodes)} nodes and {len(edges)} edges")
+        st.write("Debug: PageRank mode:", st.session_state.get("importance_metric_mode"))
+        st.write("Debug: Have full_cloutrank:", 'full_cloutrank' in st.session_state)
+        st.write("Debug: Have contributions:", 'cloutrank_contributions' in st.session_state)
+        
+        df = create_downloadable_account_table(
+            nodes, 
+            edges, 
+            include_tweets=('tweet_summaries' in st.session_state),
+            include_communities=('node_communities' in st.session_state)
+        )
+        
+        st.write(f"Debug: Created table with {len(df)} rows")
+        st.write("Debug: Columns:", list(df.columns))
+        st.write("Debug: Sample of contribution columns:")
+        st.write(df[["Screen Name", "Incoming CloutRank Contributions", "Outgoing CloutRank Contributions"]].head())
+        
+        csv = df.to_csv(index=False)
+        st.sidebar.download_button(
+            label="Download All Account Data (CSV)",
+            data=csv,
+            file_name=f"{input_username}_account_data.csv",
+            mime="text/csv",
+        )
+        
+        # Option to view the full table in the app
+        if st.sidebar.checkbox("Show Full Account Table"):
+            st.header("Complete Account Data")
+            st.dataframe(df, use_container_width=True)
 
 async def get_user_tweets_async(user_id: str, session: aiohttp.ClientSession, cursor=None):
     """Asynchronously fetch tweets from a specific user"""
@@ -1583,12 +2169,40 @@ async def get_user_tweets_async(user_id: str, session: aiohttp.ClientSession, cu
 def parse_tweet_data(json_str):
     """Parse the tweet data from the API response"""
     try:
+        # First check if the response is valid JSON
+        if not json_str or len(json_str.strip()) == 0:
+            return [], None
+            
         tweet_data = json.loads(json_str)
         tweets = []
         next_cursor = None
         
+        # Basic validation of API response format
+        if not isinstance(tweet_data, dict):
+            return [], None
+            
+        # Check for error messages in the API response
+        if "errors" in tweet_data:
+            error_msgs = [error.get("message", "Unknown error") for error in tweet_data.get("errors", [])]
+            if error_msgs:
+                st.error(f"API returned errors: {', '.join(error_msgs)}")
+            return [], None
+            
+        # Handle case where API returns empty data
+        if "data" not in tweet_data:
+            return [], None
+            
         # Navigate to the timeline instructions
         timeline = tweet_data.get("data", {}).get("user_result_by_rest_id", {}).get("result", {}).get("profile_timeline_v2", {}).get("timeline", {})
+        
+        # Check for suspended or protected accounts
+        if not timeline:
+            user_result = tweet_data.get("data", {}).get("user_result_by_rest_id", {}).get("result", {})
+            if user_result:
+                if user_result.get("__typename") == "UserUnavailable":
+                    reason = user_result.get("reason", "Account unavailable")
+                    return [], None
+            return [], None
         
         # Get all entries from the timeline
         all_entries = []
@@ -1653,7 +2267,7 @@ def parse_tweet_data(json_str):
             # Get tweet date
             created_at = legacy.get("created_at", "")
             try:
-                date_obj = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+                date_obj = dt.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
                 date_str = date_obj.strftime("%Y-%m-%d %H:%M")
             except:
                 date_str = created_at
@@ -1670,6 +2284,13 @@ def parse_tweet_data(json_str):
                 "is_retweet": is_retweet
             })
     
+    except json.JSONDecodeError as e:
+        st.error(f"Invalid JSON response from API: {str(e)}")
+        # Try to log a sample of the response for debugging
+        if json_str:
+            sample = json_str[:100] + "..." if len(json_str) > 100 else json_str
+            st.error(f"Response sample: {sample}")
+        return [], None
     except Exception as e:
         st.error(f"Error parsing tweet data: {str(e)}")
         return [], None
@@ -1677,7 +2298,7 @@ def parse_tweet_data(json_str):
     return tweets, next_cursor
 
 async def generate_tweet_summary(tweets, username):
-    """Generate an AI summary of tweets using OpenAI API"""
+    """Generate an AI summary of tweets using Gemini API"""
     if not tweets:
         return "No tweets available"
     
@@ -1692,18 +2313,13 @@ async def generate_tweet_summary(tweets, username):
 Summary:"""
 
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes Twitter content concisely."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=150,
-            temperature=0.7
-        )
+        # Initialize Gemini client
+        genai.configure(api_key=GEMINI_API_KEY)
+        client = genai.GenerativeModel("gemini-2.0-flash")
         
-        summary = response.choices[0].message.content.strip()
+        # Generate summary
+        response = client.generate_content(prompt)
+        summary = response.text.strip()
         return summary
     
     except Exception as e:
@@ -1818,7 +2434,7 @@ async def generate_community_labels_with_tweets(accounts, num_communities):
         return await process_account_chunk_with_tweets(accounts_with_tweets, num_communities)
 
 async def process_account_chunk_with_tweets(accounts, num_communities):
-    """Process a chunk of accounts to generate community labels using tweet data."""
+    """Process accounts to generate community labels using tweet data."""
     # Format account data for the prompt
     accounts_text = []
     for i, account in enumerate(accounts):
@@ -1834,40 +2450,41 @@ async def process_account_chunk_with_tweets(accounts, num_communities):
     
     accounts_formatted = "\n".join(accounts_text)
     
-    # Create the prompt
-    prompt = f"""I'm analyzing a Twitter network and need to group accounts into {num_communities} distinct communities based on their characteristics. 
+    # If text is very long, summarize
+    prompt_text = accounts_formatted
+    if len(accounts_formatted) > 1500000000:
+        # Calculate how many accounts we're truncating
+        truncated_text = accounts_formatted[:1500000000]
+        # Count how many accounts are in the truncated text by looking for Account markers
+        accounts_in_truncated = truncated_text.count("Account ")
+        remaining_accounts = len(accounts) - accounts_in_truncated
+        # Add a note about the truncated accounts
+        prompt_text = truncated_text + f"\n\n[... and {remaining_accounts} more accounts with similar patterns ...]"
+    
+    prompt = f"""I'm analyzing a Twitter network and need to group accounts into communities based on their characteristics. 
     
 For each account, I'll provide their Twitter bio description and a summary of their recent tweets.
 
-Please analyze the following accounts and suggest {num_communities} community labels that best categorize these accounts. 
-Consider both their bio descriptions AND their tweet content.
-
-IMPORTANT: One of your community labels MUST be named exactly "Other" for accounts that don't fit well into specific categories.
+Please analyze these accounts and create community labels that effectively group similar accounts together. Include an "Other" category for accounts that don't fit well into specific groups.
 
 Accounts:
-{accounts_formatted}
+{prompt_text}
 
-Please provide exactly {num_communities} descriptive community labels, each 1-3 words. Format your response as a JSON object with community IDs (0 to {num_communities-1}) as keys and labels as values. For example:
+Return your response as a JSON object mapping community IDs to descriptive labels (1-3 words each). For example:
 {{
-  "0": "Tech Enthusiasts",
-  "1": "Political Commentators",
-  "{num_communities-1}": "Other"
-}}
-"""
+  "0": "Tech Leaders",
+  "1": "News Media",
+  "2": "Other"
+}}"""
 
-    # Call OpenAI API to generate community labels
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that analyzes Twitter networks."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7
-        )
+        # Initialize Gemini client
+        genai.configure(api_key=GEMINI_API_KEY)
+        client = genai.GenerativeModel("gemini-2.0-flash")
         
-        response_text = response.choices[0].message.content.strip()
+        # Generate community labels
+        response = client.generate_content(prompt)
+        response_text = response.text.strip()
         
         # Extract JSON part from the response
         try:
@@ -1879,8 +2496,10 @@ Please provide exactly {num_communities} descriptive community labels, each 1-3 
                 return community_labels
             else:
                 st.warning(f"Could not extract JSON from the API response")
+                return {}
         except json.JSONDecodeError:
             st.warning(f"Invalid JSON format in the API response")
+            return {}
             
     except Exception as e:
         st.error(f"Error generating community labels: {str(e)}")
@@ -1948,33 +2567,33 @@ Please classify each of the following accounts into one of these communities bas
 Be thorough in your analysis of each account's content and assign it to the most appropriate community.
 
 VERY IMPORTANT: 
-1. You MUST use the COMMUNITY ID (the number) not the label name in your response
-2. The "Other" category (ID: {other_community_id}) should be used for accounts that don't clearly fit into any specific community
+1. You MUST use ONLY the COMMUNITY ID NUMBERS provided above (e.g., "0", "1", "2") - not the label names
+2. DO NOT create new community IDs - only use the exact numeric IDs listed above
+3. The "Other" category (ID: {other_community_id}) should be used for accounts that don't clearly fit into any specific community
 
 Accounts to classify:
 {chunk_formatted}
 
 Provide your answer as a JSON object mapping the Twitter username (without @) to the community ID (as a string). For example:
 {{
-  "username1": "{list(community_labels.keys())[0]}",
-  "username2": "{list(community_labels.keys())[1] if len(community_labels) > 1 else list(community_labels.keys())[0]}",
+  "username1": "0",
+  "username2": "1", 
   "username3": "{other_community_id}"
 }}
+        
+IMPORTANT: Each username must be assigned to exactly one of these community IDs: {', '.join(valid_community_ids)}
 """
-        # Call OpenAI API to classify accounts
+        # Call API to classify accounts
         try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that analyzes Twitter accounts. Only use the exact community IDs provided."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3
-            )
+            # Initialize Gemini client
+            genai.configure(api_key=GEMINI_API_KEY)
+            client = genai.GenerativeModel("gemini-2.0-flash")
+            
+            # Generate classifications
+            response = client.generate_content(prompt)
             
             # Parse response
-            response_text = response.choices[0].message.content.strip()
+            response_text = response.text.strip()
             
             try:
                 import re
@@ -2011,7 +2630,6 @@ Provide your answer as a JSON object mapping the Twitter username (without @) to
                     st.warning(f"Could not extract JSON from chunk {i+1} response")
             except json.JSONDecodeError:
                 st.warning(f"Invalid JSON format in chunk {i+1} response")
-                
         except Exception as e:
             st.error(f"Error classifying accounts in chunk {i+1}: {str(e)}")
         
@@ -2042,9 +2660,62 @@ def get_node_colors(nodes, node_communities, community_colors):
     
     return node_colors
 
+def display_tweet_fetch_summary(nodes, processed_accounts):
+    """Display a summary of tweet fetch statuses to help diagnose patterns in API failures"""
+    # Count different types of errors
+    status_counts = {}
+    accounts_by_status = {}
+    
+    for node_id, node in nodes.items():
+        if "tweet_fetch_status" in node:
+            status = node["tweet_fetch_status"]
+            # Simplify the status for categorization
+            if not status:
+                status = "Success (tweets available)"
+            
+            # Count occurrences of each status
+            if status not in status_counts:
+                status_counts[status] = 0
+                accounts_by_status[status] = []
+            
+            status_counts[status] += 1
+            accounts_by_status[status].append(node["screen_name"])
+    
+    # If no fetch statuses, return early
+    if not status_counts:
+        return
+    
+    st.write("### Tweet Fetch Status Summary")
+    
+    # Display counts in a table
+    status_data = {
+        "Status": [],
+        "Count": [],
+        "Percentage": []
+    }
+    
+    total = sum(status_counts.values())
+    
+    for status, count in sorted(status_counts.items(), key=lambda x: x[1], reverse=True):
+        status_data["Status"].append(status)
+        status_data["Count"].append(count)
+        status_data["Percentage"].append(f"{(count/total)*100:.1f}%")
+    
+    st.table(status_data)
+    
+    # Show detailed breakdown for each status type with examples
+    st.write("### Detailed Status Breakdown")
+    for status, accounts in accounts_by_status.items():
+        with st.expander(f"{status} ({len(accounts)} accounts)"):
+            # Show up to 10 example accounts
+            examples = accounts[:10]
+            st.write(", ".join([f"@{username}" for username in examples]))
+            if len(accounts) > 10:
+                st.write(f"...and {len(accounts) - 10} more")
+
 async def summarize_top_accounts(top_accounts, nodes, edges):
     """Process tweet summarization with adaptive concurrency and batch processing"""
-    st.write("Starting tweet summarization process...")
+    st.write(f"Starting tweet summarization process for {len(top_accounts)} accounts...")
     
     # Start with a conservative limit that we know works
     concurrency_limit = 10
@@ -2070,49 +2741,68 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
     
     # Fetch tweets for a batch of accounts
     async def fetch_tweets_for_batch(account_batch):
+        nonlocal failures_this_run  # Move nonlocal declaration to the beginning of the function
+        
         tweet_data = []
         
         for node_id, _, node in account_batch:
             username = node["screen_name"]
             try:
                 tweets, _ = await get_user_tweets_async(node_id, session, cursor=None)
+                if not tweets:
+                    # Add error metadata to help diagnose why no tweets were returned
+                    node["tweet_fetch_status"] = "No tweets returned by API"
+                else:
+                    node["tweet_fetch_status"] = ""  # Clear status on success
                 tweet_data.append((username, tweets))
-            except Exception as e:
-                nonlocal failures_this_run
+            except aiohttp.ClientResponseError as e:
                 failures_this_run += 1
-                st.error(f"Error fetching tweets for @{username}: {str(e)}")
+                error_msg = f"API response error (status {e.status}): {str(e)}"
+                st.error(f"Error fetching tweets for @{username}: {error_msg}")
+                node["tweet_fetch_status"] = error_msg
                 tweet_data.append((username, []))
+            # ... other exception handlers ...
                 
         return tweet_data
     
     # Process a batch of accounts with semaphore
     async def process_account_batch(batch_idx, account_batch):
+        nonlocal failures_this_run  # Also add nonlocal declaration here
+        
         async with semaphore:
             try:
-                # Fetch tweets for all accounts in the batch
+                # Fetch tweets for this batch
                 tweet_data = await fetch_tweets_for_batch(account_batch)
                 
-                # Generate summaries for the batch in a single API call
-                summaries = await generate_batch_tweet_summaries(tweet_data, batch_size)
-                
-                # Update the nodes with summaries
+                # Process results
                 results = []
-                for i, (node_id, _, node) in enumerate(account_batch):
-                    username = node["screen_name"]
-                    tweets = tweet_data[i][1] if i < len(tweet_data) else []
-                    summary = summaries.get(username, "No summary available")
+                for i, (username, tweets) in enumerate(tweet_data):
+                    # Get the node_id and node object for this account
+                    node_id, _, node = account_batch[i]
                     
-                    # Update the node
-                    nodes[node_id]["tweets"] = tweets
-                    nodes[node_id]["tweet_summary"] = summary
-                    
-                    # Add to results
-                    results.append((username, len(tweets) > 0, "Success"))
-                
+                    if tweets:
+                        # Generate summary for tweets
+                        summary = await generate_tweet_summary(tweets, username)
+                        
+                        # Store summary and tweets directly in the node object
+                        node["tweet_summary"] = summary
+                        node["tweets"] = tweets
+                        
+                        # Also update the node in the main nodes dictionary
+                        nodes[node_id]["tweet_summary"] = summary
+                        nodes[node_id]["tweets"] = tweets
+                        
+                        results.append((username, True, summary))
+                    else:
+                        # Set empty summary in the node
+                        node["tweet_summary"] = "No tweets available"
+                        nodes[node_id]["tweet_summary"] = "No tweets available"
+                        
+                        results.append((username, False, "No tweets available"))
+                        
                 return batch_idx, results
                 
             except Exception as e:
-                nonlocal failures_this_run
                 failures_this_run += 1
                 st.error(f"Error processing batch {batch_idx}: {str(e)}")
                 return batch_idx, [(node["screen_name"], False, f"Error: {str(e)}") for _, _, node in account_batch]
@@ -2129,6 +2819,13 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
             for i in range(0, len(top_accounts), batch_size):
                 batches.append((i // batch_size, top_accounts[i:i+batch_size]))
             
+            # Debug output to confirm batch count
+            st.write(f"Created {len(batches)} batches from {len(top_accounts)} accounts")
+            
+            # Debug total number of accounts
+            total_in_batches = sum(len(batch) for _, batch in batches)
+            st.write(f"DEBUG: Total accounts in all batches: {total_in_batches}")
+            
             # Create tasks for all batches
             tasks = [process_account_batch(batch_idx, account_batch) for batch_idx, account_batch in batches]
             
@@ -2142,6 +2839,25 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
                 # Count successful accounts in this batch
                 batch_successful = sum(1 for _, success, _ in results if success)
                 successful_accounts += batch_successful
+                
+                # Also update the nodes with summaries from the results
+                for username, success, summary in results:
+                    # Find the node with this username
+                    for node_id, node_data in nodes.items():
+                        if node_data.get('screen_name') == username:
+                            # Make sure the summary is properly set
+                            if success:
+                                # The summary should already be set in the process_account_batch function,
+                                # but let's make sure it's there
+                                if "tweet_summary" not in node_data or not node_data["tweet_summary"]:
+                                    node_data["tweet_summary"] = summary
+                            else:
+                                # Set a default message for failures
+                                node_data["tweet_summary"] = "No tweet summary available"
+                                
+                            # Mark that we've processed this node
+                            node_data["tweet_summary_processed"] = True
+                            break
                 
                 # Show completion message
                 st.write(f"✅ Processed batch {batch_idx+1}/{len(batches)} ({batch_successful}/{len(results)} accounts successful)")
@@ -2157,11 +2873,30 @@ async def summarize_top_accounts(top_accounts, nodes, edges):
             # Show completion message
             status_text.text(f"Tweet summarization complete! Successful: {successful_accounts}/{total_accounts}")
             
+            # Display error summary to help diagnose patterns
+            display_tweet_fetch_summary(nodes, top_accounts)
+            
             # Update session state
             st.session_state.network_data = (nodes, edges)
             
-            # Force a rerun to update the visualization
-            st.rerun()
+            # Also store filtered_nodes specifically to ensure they have tweet summaries
+            if 'all_nodes_with_tweets' not in st.session_state:
+                st.session_state.all_nodes_with_tweets = {}
+                
+            # Update all_nodes_with_tweets with any nodes that have tweet summaries
+            for node_id, node_data in nodes.items():
+                if "tweet_summary" in node_data and node_data["tweet_summary"]:
+                    if node_id not in st.session_state.all_nodes_with_tweets:
+                        st.session_state.all_nodes_with_tweets[node_id] = {}
+                    
+                    # Copy only the necessary fields
+                    st.session_state.all_nodes_with_tweets[node_id] = node_data.copy()
+            
+            # Enable tweet summaries checkbox by default
+            st.session_state.show_tweet_summaries = True
+            
+            # Don't force a rerun here - let the combined function handle it
+            # st.rerun()
     
     except Exception as e:
         st.error(f"Error in tweet summarization: {str(e)}")
@@ -2178,10 +2913,17 @@ async def generate_batch_tweet_summaries(batch_data, batch_size=5):
     # Prepare batch content for the prompt
     batch_content = []
     usernames = []
+    account_tweets_map = {}  # Track number of tweets per account
     
     # Format each account's tweets
     for username, tweets in batch_data:
         usernames.append(username)
+        account_tweets_map[username] = len(tweets)
+        
+        # Check if there are any tweets for this account
+        if not tweets:
+            continue
+            
         account_tweets = tweets[:10]  # Limit to 10 tweets per account for brevity
         tweet_texts = [f"@{username} {tweet['date']}: {tweet['text']}" for tweet in account_tweets]
         batch_content.extend(tweet_texts)
@@ -2193,7 +2935,17 @@ async def generate_batch_tweet_summaries(batch_data, batch_size=5):
     if batch_content and batch_content[-1] == "---":
         batch_content.pop()
     
-    prompt = f"""Analyze the following tweets from {len(usernames)} different Twitter accounts.
+    # Initialize results with specific error messages for accounts with no tweets
+    summaries = {}
+    for username in usernames:
+        if account_tweets_map[username] == 0:
+            summaries[username] = "No tweets available for this account"
+    
+    # If no accounts have tweets, return early
+    if not batch_content:
+        return summaries
+    
+    prompt = f"""Analyze the following tweets from {len([u for u in usernames if account_tweets_map[u] > 0])} different Twitter accounts.
 For EACH account, provide a brief summary (max 50 words) of their main topics, interests, and tone.
 
 Tweets:
@@ -2206,20 +2958,15 @@ Response format:
 """
 
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that analyzes Twitter content. Provide concise summaries for multiple accounts."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=len(usernames) * 100,  # Allow enough tokens for all summaries
-            temperature=0.7
-        )
+        # Initialize Gemini client
+        genai.configure(api_key=GEMINI_API_KEY)
+        client = genai.GenerativeModel("gemini-2.0-flash")
+        
+        # Generate batch summaries
+        response = client.generate_content(prompt)
         
         # Parse the response to extract summaries for each account
-        summaries = {}
-        text = response.choices[0].message.content.strip()
+        text = response.text.strip()
         
         for line in text.split('\n'):
             if line.startswith('@') and ':' in line:
@@ -2228,16 +2975,94 @@ Response format:
                 if username in usernames:
                     summaries[username] = summary.strip()
         
-        # Ensure all accounts have summaries
+        # Ensure all accounts with tweets have summaries
         for username in usernames:
-            if username not in summaries:
-                summaries[username] = "No summary generated"
+            if username not in summaries and account_tweets_map[username] > 0:
+                summaries[username] = "API generated no summary despite tweets being available"
         
         return summaries
     
     except Exception as e:
-        st.error(f"Error generating batch summaries: {str(e)}")
-        return {username: f"Error: {str(e)}" for username in usernames}
+        error_message = str(e)
+        st.error(f"Error generating batch summaries: {error_message}")
+        
+        # Provide specific error messages based on the exception
+        error_type = "API error"
+        if "rate limit" in error_message.lower():
+            error_type = "Rate limit exceeded"
+        elif "timeout" in error_message.lower():
+            error_type = "API timeout"
+        elif "auth" in error_message.lower() or "key" in error_message.lower():
+            error_type = "API authentication error"
+        
+        # Set error message for all accounts that don't already have summaries
+        for username in usernames:
+            if username not in summaries:
+                summaries[username] = f"Error: {error_type} - {error_message[:50]}..."
+        
+        return summaries
+
+def make_color_more_distinct(hex_color):
+    """Make colors more distinct by increasing saturation and adjusting value"""
+    # Convert hex to RGB
+    hex_color = hex_color.lstrip('#')
+    r, g, b = tuple(int(hex_color[i:i+2], 16)/255 for i in (0, 2, 4))
+    
+    # Convert RGB to HSV
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    
+    # Increase saturation, ensure good value
+    s = min(1.0, s * 1.3)  # Increase saturation by 30%
+    v = max(0.6, min(0.95, v))  # Keep value in a good range
+    
+    # Convert back to RGB
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    
+    # Convert to hex
+    return '#{:02x}{:02x}{:02x}'.format(
+        int(r * 255),
+        int(g * 255),
+        int(b * 255))
+
+def categorize_communities(community_labels):
+    """Group communities into broader categories for better organization"""
+    # Define category keywords
+    categories = {
+        "Technology": ["ai", "software", "dev", "tech", "computer", "engineer", "automation", "robotics", 
+                      "open source", "security", "privacy", "uiux", "design"],
+        "Business": ["vc", "investor", "startup", "founder", "ceo", "business", "marketing", 
+                    "growth", "sales", "careers", "jobs", "y combinator"],
+        "Finance": ["financial", "trading", "crypto", "web3"],
+        "Politics": ["political", "government", "regulation", "regulatory", "conflict", "ukraine", 
+                    "russia", "israel", "palestine"],
+        "Science": ["research", "academic", "neuroscience", "bci", "science", "stem", "space", 
+                   "exploration", "health", "longevity", "theoretical"],
+        "Creative": ["artist", "designer", "music", "arts", "food"],
+        "Social": ["community", "support", "personal", "sports", "culture", "family", "e/acc", "reflection"],
+        "Media": ["news", "journalism", "publisher", "book"],
+        "Geographic": ["indian", "chinese", "irish"],
+        "Other": ["other", "random"]
+    }
+    
+    # Create mapping from community ID to category
+    community_categories = {}
+    
+    for comm_id, label in community_labels.items():
+        assigned = False
+        label_lower = label.lower()
+        
+        # Try to find matching category
+        for category, keywords in categories.items():
+            if any(keyword in label_lower for keyword in keywords):
+                community_categories[comm_id] = category
+                assigned = True
+                break
+        
+        # If no category matches, use "Other"
+        if not assigned:
+            community_categories[comm_id] = "Other"
+    
+    return community_categories
 
 if __name__ == "__main__":
     main()
